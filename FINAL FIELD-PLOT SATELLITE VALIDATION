@@ -1,0 +1,428 @@
+
+/*******************************************************************************
+  FINAL FIELD-PLOT SATELLITE VALIDATION
+  Plots: P01-P71
+  Reference: wet-season field AGB inventory
+  Sensors: Sentinel-2 SR Harmonized + Sentinel-1 GRD
+
+  Processing:
+    1. Reconstruct original geometries from coordinates.
+    2. Resize to provisional 20 x 20 m squares.
+    3. Keep plots intersecting the study area.
+    4. Create cloud-masked Sentinel-2 NDVI, SAVI, RENDVI.
+    5. Create Sentinel-1 VV, VH and VV-VH layers.
+    6. Extract plot-level mean values in plot-ID order.
+    7. Export one multiband GeoTIFF and one CSV.
+
+  NOTE: Resized plot centers are estimates, not GPS-verified.
+*******************************************************************************/
+
+// =============================================================================
+// 1. SETTINGS AND INPUT ASSETS
+// =============================================================================
+
+var plotAssetID =
+  'projects/ee-yosef369/assets/field_plots_20x20m_RSE';
+
+var studyAreaAssetID =
+  'projects/ee-yosef369/assets/Study_area';
+
+var startDate = '2025-06-01';
+var endDate   = '2025-10-01'; // Exclusive
+
+var plotSizeM = 20;
+var halfSizeM = plotSizeM / 2;
+
+var plotsOriginal = ee.FeatureCollection(plotAssetID);
+var studyAreaFC = ee.FeatureCollection(studyAreaAssetID);
+var studyArea = studyAreaFC.geometry();
+
+print('Original plot count:', plotsOriginal.size());
+print(
+  'Unique original plot IDs:',
+  plotsOriginal.aggregate_array('plot_id').distinct().size()
+);
+print('Study-area features:', studyAreaFC.size());
+
+// =============================================================================
+// 2. RECONSTRUCT AND RESIZE PLOTS
+// =============================================================================
+// Read coordinate arrays directly to avoid geometry area/centroid/bounds
+// operations on the original geometries.
+//
+// Each new square is centered on the original coordinate bounding-box center.
+// This corrects the nominal size but cannot correct an incorrectly located
+// original polygon center.
+
+var resizedPlots = plotsOriginal.map(function(feature) {
+  feature = ee.Feature(feature);
+
+  var rings = ee.List(feature.geometry().coordinates());
+  var ring = ee.List(rings.get(0));
+
+  var longitudes = ring.map(function(point) {
+    return ee.Number(ee.List(point).get(0));
+  });
+
+  var latitudes = ring.map(function(point) {
+    return ee.Number(ee.List(point).get(1));
+  });
+
+  var minLon = ee.Number(longitudes.reduce(ee.Reducer.min()));
+  var maxLon = ee.Number(longitudes.reduce(ee.Reducer.max()));
+  var minLat = ee.Number(latitudes.reduce(ee.Reducer.min()));
+  var maxLat = ee.Number(latitudes.reduce(ee.Reducer.max()));
+
+  var centerLon = minLon.add(maxLon).divide(2);
+  var centerLat = minLat.add(maxLat).divide(2);
+
+  var latRad = centerLat.multiply(Math.PI / 180);
+
+  // Local approximation for converting metres to degrees.
+  var metersPerDegreeLon =
+    ee.Number(111320).multiply(latRad.cos());
+
+  var metersPerDegreeLat = ee.Number(110574);
+
+  var halfLon = ee.Number(halfSizeM).divide(metersPerDegreeLon);
+  var halfLat = ee.Number(halfSizeM).divide(metersPerDegreeLat);
+
+  var squareCoordinates = [[
+    [
+      centerLon.subtract(halfLon),
+      centerLat.subtract(halfLat)
+    ],
+    [
+      centerLon.add(halfLon),
+      centerLat.subtract(halfLat)
+    ],
+    [
+      centerLon.add(halfLon),
+      centerLat.add(halfLat)
+    ],
+    [
+      centerLon.subtract(halfLon),
+      centerLat.add(halfLat)
+    ],
+    [
+      centerLon.subtract(halfLon),
+      centerLat.subtract(halfLat)
+    ]
+  ]];
+
+  var squareGeometry = ee.Geometry.Polygon(
+    squareCoordinates,
+    'EPSG:4326',
+    false
+  );
+
+  // Original polygon dimensions, approximated from coordinate bounds.
+  var originalWidthM =
+    maxLon.subtract(minLon).multiply(metersPerDegreeLon);
+
+  var originalHeightM =
+    maxLat.subtract(minLat).multiply(metersPerDegreeLat);
+
+  var originalAreaApproxM2 =
+    originalWidthM.multiply(originalHeightM);
+
+  var storedArea = ee.Number(
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(feature.get('plot_area_m2'), null),
+      400,
+      feature.get('plot_area_m2')
+    )
+  );
+
+  var plotID = ee.String(feature.get('plot_id'));
+
+  var plotOrder = ee.Number.parse(plotID.slice(1));
+
+  return ee.Feature(squareGeometry, feature.toDictionary())
+    .set({
+      'plot_id': plotID,
+      'plot_order': plotOrder,
+      'plot_area_m2': 400,
+      'plot_area_ha': 0.04,
+      'center_lon_est': centerLon,
+      'center_lat_est': centerLat,
+      'original_width_approx_m': originalWidthM,
+      'original_height_approx_m': originalHeightM,
+      'original_area_approx_m2': originalAreaApproxM2,
+      'stored_area_original_m2': storedArea,
+      'original_area_ratio': originalAreaApproxM2.divide(storedArea),
+      'nominal_plot_width_m': plotSizeM,
+      'nominal_plot_height_m': plotSizeM,
+      'nominal_area_m2': 400,
+      'recovery_status': 'PROVISIONAL_CENTER'
+    });
+}).sort('plot_order');
+
+print('Resized plots:', resizedPlots.size());
+print('Resized plot sample:', resizedPlots.limit(5));
+
+// =============================================================================
+// 3. FILTER TO PLOTS INTERSECTING THE STUDY AREA
+// =============================================================================
+
+var plotsInside = resizedPlots
+  .filterBounds(studyArea)
+  .sort('plot_order');
+
+print('Plots overlapping study area:', plotsInside.size());
+print(
+  'Retained plot IDs in order:',
+  plotsInside.aggregate_array('plot_id')
+);
+
+// =============================================================================
+// 4. SENTINEL-2 COMPOSITE AND VEGETATION INDICES
+// =============================================================================
+
+var s2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(studyArea)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 80));
+
+function makeS2Indices(image) {
+  var scl = image.select('SCL');
+
+  // Mask defective pixels, shadows, clouds, cirrus and snow/ice.
+  var validMask = scl.neq(1)
+    .and(scl.neq(3))
+    .and(scl.neq(7))
+    .and(scl.neq(8))
+    .and(scl.neq(9))
+    .and(scl.neq(10))
+    .and(scl.neq(11));
+
+  var reflectance = image
+    .select(['B4', 'B5', 'B8', 'B8A'])
+    .multiply(0.0001)
+    .updateMask(validMask);
+
+  var red = reflectance.select('B4');
+  var redEdge = reflectance.select('B5');
+  var nir = reflectance.select('B8');
+  var nirNarrow = reflectance.select('B8A');
+
+  var ndvi = nir.subtract(red)
+    .divide(nir.add(red))
+    .rename('NDVI');
+
+  // SAVI with soil-adjustment factor L = 0.5.
+  var savi = nir.subtract(red)
+    .multiply(1.5)
+    .divide(nir.add(red).add(0.5))
+    .rename('SAVI');
+
+  // Red-edge NDVI.
+  var rendvi = nirNarrow.subtract(redEdge)
+    .divide(nirNarrow.add(redEdge))
+    .rename('RENDVI');
+
+  return ndvi
+    .addBands(savi)
+    .addBands(rendvi)
+    .copyProperties(image, ['system:time_start']);
+}
+
+var s2IndicesCollection = s2Collection.map(makeS2Indices);
+
+print('Sentinel-2 scenes before pixel masking:', s2Collection.size());
+print('Sentinel-2 indexed scenes:', s2IndicesCollection.size());
+
+var opticalIndices = s2IndicesCollection
+  .median()
+  .select(['NDVI', 'SAVI', 'RENDVI'])
+  .clip(studyArea);
+
+// =============================================================================
+// 5. SENTINEL-1 RADAR COMPOSITE
+// =============================================================================
+
+var s1Collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(studyArea)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains(
+    'transmitterReceiverPolarisation', 'VV'
+  ))
+  .filter(ee.Filter.listContains(
+    'transmitterReceiverPolarisation', 'VH'
+  ))
+  .select(['VV', 'VH']);
+
+print('Sentinel-1 scenes:', s1Collection.size());
+
+// Sentinel-1 GRD VV/VH values are in dB in this collection.
+var s1 = s1Collection
+  .median()
+  .rename(['S1_VV_dB', 'S1_VH_dB'])
+  .clip(studyArea);
+
+var s1Difference = s1.select('S1_VV_dB')
+  .subtract(s1.select('S1_VH_dB'))
+  .rename('S1_VV_minus_VH_dB')
+  .clip(studyArea);
+
+// =============================================================================
+// 6. FINAL CLIPPED MULTIBAND MAP
+// =============================================================================
+
+var finalMap = opticalIndices
+  .addBands(s1)
+  .addBands(s1Difference)
+  .clip(studyArea)
+  .toFloat();
+
+Map.centerObject(studyAreaFC, 10);
+
+Map.addLayer(
+  studyAreaFC.style({
+    color: 'FFFF00',
+    fillColor: '00000000',
+    width: 2
+  }),
+  {},
+  'Study area boundary',
+  true
+);
+
+Map.addLayer(
+  opticalIndices.select('NDVI'),
+  {
+    min: 0,
+    max: 0.8,
+    palette: ['#8c510a', '#dfc27d', '#80cdc1', '#01665e']
+  },
+  '2025 wet-season NDVI',
+  true
+);
+
+Map.addLayer(
+  opticalIndices.select('SAVI'),
+  {min: 0, max: 0.8, palette: ['#8c510a', '#dfc27d', '#01665e']},
+  '2025 SAVI',
+  false
+);
+
+Map.addLayer(
+  opticalIndices.select('RENDVI'),
+  {min: -0.2, max: 0.8, palette: ['#8c510a', '#dfc27d', '#01665e']},
+  '2025 RENDVI',
+  false
+);
+
+Map.addLayer(
+  s1.select('S1_VV_dB'),
+  {min: -25, max: 0},
+  'Sentinel-1 VV (dB)',
+  false
+);
+
+Map.addLayer(
+  s1.select('S1_VH_dB'),
+  {min: -32, max: -5},
+  'Sentinel-1 VH (dB)',
+  false
+);
+
+Map.addLayer(
+  plotsInside.style({
+    color: '00FFFF',
+    fillColor: '00FFFF22',
+    width: 1
+  }),
+  {},
+  'Resized 20 m plots inside study area',
+  true
+);
+
+var estimatedCenters = plotsInside.map(function(feature) {
+  return ee.Feature(
+    ee.Geometry.Point([
+      feature.get('center_lon_est'),
+      feature.get('center_lat_est')
+    ]),
+    {
+      'plot_id': feature.get('plot_id'),
+      'plot_order': feature.get('plot_order')
+    }
+  );
+});
+
+Map.addLayer(
+  estimatedCenters,
+  {color: 'FFFF00'},
+  'Estimated plot centers',
+  false
+);
+
+// =============================================================================
+// 7. EXTRACT PLOT-LEVEL VALUES
+// =============================================================================
+
+var plotStats = finalMap.reduceRegions({
+  collection: plotsInside,
+  reducer: ee.Reducer.mean(),
+  scale: 20,
+  tileScale: 4
+}).sort('plot_order');
+
+print('Final plot records:', plotStats.size());
+print('First extracted record:', plotStats.first());
+print('First five extracted records:', plotStats.limit(5));
+
+// =============================================================================
+// 8. EXPORT FINAL MAP — GEOTIFF
+// =============================================================================
+
+Export.image.toDrive({
+  image: finalMap,
+  description: 'Final_2025_S1_S2_FieldValidation_Map',
+  folder: 'GEE_Field_Validation',
+  fileNamePrefix: 'Final_2025_S1_S2_FieldValidation_Map',
+  region: studyArea,
+  scale: 20,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+// =============================================================================
+// 9. EXPORT FINAL PLOT CSV — SORTED BY PLOT ID
+// =============================================================================
+// Geometry audit fields are included in this same CSV to avoid a redundant
+// separate audit export.
+
+Export.table.toDrive({
+  collection: plotStats,
+  description: 'Final_2025_FieldPlot_S1_S2_Validation',
+  folder: 'GEE_Field_Validation',
+  fileNamePrefix: 'Final_2025_FieldPlot_S1_S2_Validation',
+  fileFormat: 'CSV',
+  selectors: [
+    'plot_order',
+    'plot_id',
+    'plot_area_m2',
+    'plot_area_ha',
+    'center_lon_est',
+    'center_lat_est',
+    'nominal_plot_width_m',
+    'nominal_plot_height_m',
+    'original_width_approx_m',
+    'original_height_approx_m',
+    'original_area_approx_m2',
+    'stored_area_original_m2',
+    'original_area_ratio',
+    'recovery_status',
+    'NDVI',
+    'SAVI',
+    'RENDVI',
+    'S1_VV_dB',
+    'S1_VH_dB',
+    'S1_VV_minus_VH_dB'
+  ]
+});
+
+print('Two export tasks are ready: final map and ordered CSV.');
