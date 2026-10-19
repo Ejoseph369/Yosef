@@ -1,0 +1,1848 @@
+// ============================================================================
+// OLD PAPER — GREEN LEGACY INITIATIVE / AFFORESTATION
+// BALE MOUNTAINS ECO-REGION, ETHIOPIA
+//
+// MAP PRODUCTION — CLEAN WORKING VERSION
+// ============================================================================
+//
+// Baseline: 2015–2018
+// Post:     2019–2025
+//
+// Core outputs:
+//
+// 1. Persistent woody establishment
+// 2. Treatment intensity
+// 3. ΔNDVI
+// 4. ΔET
+// 5. ΔLST
+// 6. ΔP
+// 7. ΔPET
+// 8. ΔWBP = Δ(ET-P)
+// 9. ΔEI  = Δ(ET/P)
+// 10. ΔAI = Δ(PET/P)
+// 11. ΔAlbedo
+// 12. Context maps
+//
+// IMPORTANT:
+// This script produces spatial layers for the old paper.
+// It does NOT replace the manuscript's propensity-score +
+// Mahalanobis matching workflow.
+//
+// ============================================================================
+
+
+// ============================================================================
+// 0. STUDY AREA
+// ============================================================================
+
+var studyArea =
+    ee.FeatureCollection(
+      'projects/ee-yosef369/assets/Study_area'
+    );
+
+var roi = studyArea.geometry();
+
+Map.centerObject(roi, 8);
+
+Map.addLayer(
+  roi,
+  {color: 'red'},
+  'Study area'
+);
+
+
+// ============================================================================
+// 1. SETTINGS
+// ============================================================================
+
+var BASE_START = '2015-01-01';
+var BASE_END   = '2018-12-30';
+
+var POST_START = '2019-01-01';
+var POST_END   = '2026-01-01';
+
+var EXPORT_FOLDER =
+    'Afforestation_Maps_OldPaper';
+
+var MIN_POST_FOREST_YEARS = 5;
+
+
+// ============================================================================
+// 2. DATASETS
+// ============================================================================
+
+// Dynamic World
+var DW =
+    ee.ImageCollection(
+      'GOOGLE/DYNAMICWORLD/V1'
+    );
+
+// NDVI — 250 m
+var NDVI =
+    ee.ImageCollection(
+      'MODIS/061/MOD13Q1'
+    );
+
+// -----------------------------------------------------------------------------
+// IMPORTANT ET FIX
+//
+// MOD16A2.061 begins in 2021.
+// MOD16A2GF.061 provides the gap-filled historical record.
+//
+// We therefore use:
+//
+// 2015–2020 → MOD16A2GF
+// 2021–2025 → MOD16A2
+//
+// -----------------------------------------------------------------------------
+
+var ET_GF =
+    ee.ImageCollection(
+      'MODIS/061/MOD16A2GF'
+    );
+
+var ET_CURRENT =
+    ee.ImageCollection(
+      'MODIS/061/MOD16A2'
+    );
+
+
+// LST — 1 km
+var LST =
+    ee.ImageCollection(
+      'MODIS/061/MOD11A2'
+    );
+
+// Albedo — 500 m
+var ALBEDO =
+    ee.ImageCollection(
+      'MODIS/061/MCD43A3'
+    );
+
+// CHIRPS precipitation
+var CHIRPS =
+    ee.ImageCollection(
+      'UCSB-CHG/CHIRPS/DAILY'
+    );
+
+// ERA5-Land monthly
+var ERA5L =
+    ee.ImageCollection(
+      'ECMWF/ERA5_LAND/MONTHLY_AGGR'
+    );
+
+
+// ============================================================================
+// 3. DATASET DIAGNOSTICS
+// ============================================================================
+
+print('================================================');
+print('DATASET DIAGNOSTICS');
+print('================================================');
+
+print(
+  'MOD16A2GF total images:',
+  ET_GF.size()
+);
+
+print(
+  'MOD16A2 current total images:',
+  ET_CURRENT.size()
+);
+
+print(
+  'MOD16A2GF 2015 images:',
+  ET_GF
+    .filterDate('2015-01-01', '2016-01-01')
+    .filterBounds(roi)
+    .size()
+);
+
+print(
+  'MOD16A2 2015 images:',
+  ET_CURRENT
+    .filterDate('2015-01-01', '2016-01-01')
+    .filterBounds(roi)
+    .size()
+);
+
+print(
+  'MOD16A2 2021 images:',
+  ET_CURRENT
+    .filterDate('2021-01-01', '2022-01-01')
+    .filterBounds(roi)
+    .size()
+);
+
+print(
+  'ERA5-Land images:',
+  ERA5L.size()
+);
+
+print(
+  'ERA5-Land 2015 images:',
+  ERA5L
+    .filterDate('2015-01-01', '2016-01-01')
+    .filterBounds(roi)
+    .size()
+);
+
+
+// ============================================================================
+// 4. DYNAMIC WORLD — PERSISTENT WOODY ESTABLISHMENT
+// ============================================================================
+
+var dwBaseline =
+    DW
+      .filterDate(
+        BASE_START,
+        BASE_END
+      )
+      .filterBounds(roi);
+
+var dwPost =
+    DW
+      .filterDate(
+        POST_START,
+        POST_END
+      )
+      .filterBounds(roi);
+
+
+// -----------------------------------------------------------------------------
+// Baseline forest
+// -----------------------------------------------------------------------------
+
+var baselineForest =
+    dwBaseline
+      .select('label')
+      .mode()
+      .eq(1)
+      .rename('baseline_forest');
+
+
+// -----------------------------------------------------------------------------
+// Annual post-period forest
+// -----------------------------------------------------------------------------
+
+var postYears =
+    ee.List.sequence(
+      2019,
+      2025
+    );
+
+
+var postForestAnnual =
+    ee.ImageCollection.fromImages(
+
+      postYears.map(
+        function(year) {
+
+          year =
+              ee.Number(year);
+
+          var start =
+              ee.Date.fromYMD(
+                year,
+                1,
+                1
+              );
+
+          var end =
+              start.advance(
+                1,
+                'year'
+              );
+
+          var forest =
+              DW
+                .filterDate(
+                  start,
+                  end
+                )
+                .filterBounds(roi)
+                .select('label')
+                .mode()
+                .eq(1)
+                .rename('forest');
+
+          return forest.set(
+            'year',
+            year
+          );
+        }
+      )
+    );
+
+
+// -----------------------------------------------------------------------------
+// Count forest years
+// -----------------------------------------------------------------------------
+
+var postForestCount =
+    postForestAnnual
+      .sum()
+      .rename(
+        'post_forest_year_count'
+      );
+
+
+// -----------------------------------------------------------------------------
+// Persistent forest
+// -----------------------------------------------------------------------------
+
+var persistentPostForest =
+    postForestCount
+      .gte(
+        MIN_POST_FOREST_YEARS
+      )
+      .rename(
+        'persistent_post_forest'
+      );
+
+
+// -----------------------------------------------------------------------------
+// Candidate woody establishment
+// -----------------------------------------------------------------------------
+
+var candidateTreatment =
+    baselineForest
+      .not()
+      .and(
+        persistentPostForest
+      )
+      .rename(
+        'candidate_woody_establishment'
+      );
+
+
+Map.addLayer(
+  candidateTreatment.selfMask(),
+  {palette: ['red']},
+  'Candidate woody establishment'
+);
+
+
+// ============================================================================
+// 5. NATIVE MODIS PROJECTIONS
+// ============================================================================
+
+var ndviProj =
+    NDVI
+      .first()
+      .select('NDVI')
+      .projection();
+
+
+var etProj =
+    ET_GF
+      .first()
+      .select('ET')
+      .projection();
+
+
+var lstProj =
+    LST
+      .first()
+      .select('LST_Day_1km')
+      .projection();
+
+
+var albedoProj =
+    ALBEDO
+      .first()
+      .select(
+        'Albedo_WSA_shortwave'
+      )
+      .projection();
+
+
+// ============================================================================
+// 6. TREATMENT FRACTION
+// ============================================================================
+
+function treatmentFraction(
+    targetProjection,
+    name
+) {
+
+  return candidateTreatment
+    .setDefaultProjection(
+      candidateTreatment
+        .projection()
+    )
+    .reduceResolution({
+      reducer:
+        ee.Reducer.mean(),
+
+      maxPixels:
+        4096
+    })
+    .reproject(
+      targetProjection
+    )
+    .rename(name);
+}
+
+
+var treatmentNDVI =
+    treatmentFraction(
+      ndviProj,
+      'treatment_fraction_250m'
+    );
+
+
+var treatmentET =
+    treatmentFraction(
+      etProj,
+      'treatment_fraction_500m'
+    );
+
+
+var treatmentLST =
+    treatmentFraction(
+      lstProj,
+      'treatment_fraction_1km'
+    );
+
+
+// ============================================================================
+// 7. ANNUAL NDVI
+// ============================================================================
+
+function annualNDVI(year) {
+
+  year =
+      ee.Number(year);
+
+  var start =
+      ee.Date.fromYMD(
+        year,
+        1,
+        1
+      );
+
+  var end =
+      start.advance(
+        1,
+        'year'
+      );
+
+  return NDVI
+    .filterDate(
+      start,
+      end
+    )
+    .filterBounds(roi)
+    .select('NDVI')
+    .mean()
+    .multiply(0.0001)
+    .rename('NDVI')
+    .set(
+      'year',
+      year
+    );
+}
+
+
+// ============================================================================
+// 8. ANNUAL ET — FIXED
+// ============================================================================
+//
+// 2015–2020 → MOD16A2GF
+// 2021–2025 → MOD16A2
+//
+// Both products have ET in kg m-2 per composite period.
+// Numerically this is equivalent to mm for water depth.
+// Scale factor = 0.1.
+//
+// ============================================================================
+
+function annualET(year) {
+
+  year =
+      ee.Number(year);
+
+  var start =
+      ee.Date.fromYMD(
+        year,
+        1,
+        1
+      );
+
+  var end =
+      start.advance(
+        1,
+        'year'
+      );
+
+
+  // Historical gap-filled product
+  var historical =
+      ET_GF
+        .filterDate(
+          start,
+          end
+        )
+        .filterBounds(roi)
+        .select('ET');
+
+
+  // Current product
+  var current =
+      ET_CURRENT
+        .filterDate(
+          start,
+          end
+        )
+        .filterBounds(roi)
+        .select('ET');
+
+
+  // Select appropriate collection
+  var selected =
+      ee.ImageCollection(
+        ee.Algorithms.If(
+          year.lte(2020),
+          historical,
+          current
+        )
+      );
+
+
+  return selected
+    .map(
+      function(img) {
+
+        return img
+          .multiply(0.1)
+          .copyProperties(
+            img,
+            ['system:time_start']
+          );
+      }
+    )
+    .sum()
+    .rename('ET')
+    .set(
+      'year',
+      year
+    );
+}
+
+
+// ============================================================================
+// 9. ANNUAL LST
+// ============================================================================
+
+function annualLST(year) {
+
+  year =
+      ee.Number(year);
+
+  var start =
+      ee.Date.fromYMD(
+        year,
+        1,
+        1
+      );
+
+  var end =
+      start.advance(
+        1,
+        'year'
+      );
+
+  return LST
+    .filterDate(
+      start,
+      end
+    )
+    .filterBounds(roi)
+    .select(
+      'LST_Day_1km'
+    )
+    .mean()
+    .multiply(0.02)
+    .subtract(273.15)
+    .rename('LST')
+    .set(
+      'year',
+      year
+    );
+}
+
+
+// ============================================================================
+// 10. ANNUAL ALBEDO
+// ============================================================================
+
+function annualAlbedo(year) {
+
+  year =
+      ee.Number(year);
+
+  var start =
+      ee.Date.fromYMD(
+        year,
+        1,
+        1
+      );
+
+  var end =
+      start.advance(
+        1,
+        'year'
+      );
+
+  return ALBEDO
+    .filterDate(
+      start,
+      end
+    )
+    .filterBounds(roi)
+    .select(
+      'Albedo_WSA_shortwave'
+    )
+    .mean()
+    .multiply(0.001)
+    .rename('albedo')
+    .set(
+      'year',
+      year
+    );
+}
+
+
+// ============================================================================
+// 11. ANNUAL PRECIPITATION
+// ============================================================================
+
+function annualP(year) {
+
+  year =
+      ee.Number(year);
+
+  var start =
+      ee.Date.fromYMD(
+        year,
+        1,
+        1
+      );
+
+  var end =
+      start.advance(
+        1,
+        'year'
+      );
+
+  return CHIRPS
+    .filterDate(
+      start,
+      end
+    )
+    .filterBounds(roi)
+    .select(
+      'precipitation'
+    )
+    .sum()
+    .rename('P')
+    .set(
+      'year',
+      year
+    );
+}
+
+
+// ============================================================================
+// 12. FAO PENMAN–MONTEITH PET
+// ============================================================================
+
+var U10_TO_U2 =
+    4.87 /
+    Math.log(
+      67.8 * 10 - 5.42
+    );
+
+
+function saturationVaporPressure(
+    Tc
+) {
+
+  return Tc.expression(
+    '0.6108 * exp((17.27*T)/(T+237.3))',
+    {
+      T: Tc
+    }
+  );
+}
+
+
+function deltaVaporPressure(
+    Tc
+) {
+
+  var es =
+      saturationVaporPressure(
+        Tc
+      );
+
+  return es.expression(
+    '4098*es/pow(T+237.3,2)',
+    {
+      es: es,
+      T: Tc
+    }
+  );
+}
+
+
+// -----------------------------------------------------------------------------
+// Monthly FAO-PM
+// -----------------------------------------------------------------------------
+
+function monthlyFAOPM(img) {
+
+  var T =
+      img
+        .select(
+          'temperature_2m'
+        )
+        .subtract(273.15);
+
+
+  var Td =
+      img
+        .select(
+          'dewpoint_temperature_2m'
+        )
+        .subtract(273.15);
+
+
+  var es =
+      saturationVaporPressure(
+        T
+      );
+
+
+  var ea =
+      saturationVaporPressure(
+        Td
+      );
+
+
+  var vpd =
+      es
+        .subtract(ea)
+        .max(0);
+
+
+  var delta =
+      deltaVaporPressure(
+        T
+      );
+
+
+  var pressureKPa =
+      img
+        .select(
+          'surface_pressure'
+        )
+        .divide(1000);
+
+
+  var gamma =
+      pressureKPa
+        .multiply(0.000665);
+
+
+  var u10 =
+      img
+        .select(
+          'u_component_of_wind_10m'
+        )
+        .pow(2)
+        .add(
+          img
+            .select(
+              'v_component_of_wind_10m'
+            )
+            .pow(2)
+        )
+        .sqrt();
+
+
+  var u2 =
+      u10.multiply(
+        U10_TO_U2
+      );
+
+
+  var date =
+      ee.Date(
+        img.get(
+          'system:time_start'
+        )
+      );
+
+
+  var nextDate =
+      date.advance(
+        1,
+        'month'
+      );
+
+
+  var days =
+      nextDate.difference(
+        date,
+        'day'
+      );
+
+
+  // Net radiation
+  var Rn_month =
+      img
+        .select(
+          'surface_net_solar_radiation_sum'
+        )
+        .add(
+          img.select(
+            'surface_net_thermal_radiation_sum'
+          )
+        )
+        .divide(1e6);
+
+
+  var Rn_daily =
+      Rn_month.divide(
+        days
+      );
+
+
+  var numerator =
+      delta
+        .multiply(0.408)
+        .multiply(
+          Rn_daily
+        )
+        .add(
+          gamma
+            .multiply(900)
+            .divide(
+              T.add(273.15)
+            )
+            .multiply(u2)
+            .multiply(vpd)
+        );
+
+
+  var denominator =
+      delta.add(
+        gamma.multiply(
+          ee.Image.constant(1)
+            .add(
+              u2.multiply(0.34)
+            )
+        )
+      );
+
+
+  var ET0_daily =
+      numerator
+        .divide(
+          denominator
+        )
+        .max(0);
+
+
+  var PET_month =
+      ET0_daily
+        .multiply(days)
+        .rename('PET');
+
+
+  return PET_month
+    .copyProperties(
+      img,
+      ['system:time_start']
+    );
+}
+
+
+// -----------------------------------------------------------------------------
+// Annual PET
+// -----------------------------------------------------------------------------
+
+function annualPET(year) {
+
+  year =
+      ee.Number(year);
+
+  var start =
+      ee.Date.fromYMD(
+        year,
+        1,
+        1
+      );
+
+  var end =
+      start.advance(
+        1,
+        'year'
+      );
+
+
+  var monthly =
+      ERA5L
+        .filterDate(
+          start,
+          end
+        )
+        .filterBounds(roi);
+
+
+  return monthly
+    .map(
+      monthlyFAOPM
+    )
+    .sum()
+    .rename('PET')
+    .set(
+      'year',
+      year
+    );
+}
+
+
+// ============================================================================
+// 13. BUILD CORE ANNUAL COLLECTION
+// ============================================================================
+
+var years =
+    ee.List.sequence(
+      2015,
+      2025
+    );
+
+
+var annualCollection =
+    ee.ImageCollection.fromImages(
+
+      years.map(
+        function(year) {
+
+          var ndvi =
+              annualNDVI(year);
+
+          var et =
+              annualET(year);
+
+          var lst =
+              annualLST(year);
+
+          var albedo =
+              annualAlbedo(year);
+
+          var p =
+              annualP(year);
+
+          var pet =
+              annualPET(year);
+
+
+          // WBP = ET - P
+          var wbp =
+              et
+                .subtract(p)
+                .rename('WBP');
+
+
+          // EI = ET / P
+          var ei =
+              et
+                .divide(
+                  p.max(1)
+                )
+                .rename('EI');
+
+
+          // AI = PET / P
+          var ai =
+              pet
+                .divide(
+                  p.max(1)
+                )
+                .rename('AI');
+
+
+          return ee.Image.cat([
+            ndvi,
+            et,
+            lst,
+            albedo,
+            p,
+            pet,
+            wbp,
+            ei,
+            ai
+          ])
+          .set(
+            'year',
+            year
+          )
+          .clip(roi);
+        }
+      )
+    );
+
+
+// ============================================================================
+// 14. CORE DIAGNOSTICS
+// ============================================================================
+
+print('================================================');
+print('CORE ANNUAL COLLECTION');
+print('================================================');
+
+print(
+  'Annual collection:',
+  annualCollection
+);
+
+
+print(
+  'Annual collection size:',
+  annualCollection.size()
+);
+
+
+print(
+  'First annual image:',
+  annualCollection.first()
+);
+
+
+print(
+  'First annual image bands:',
+  annualCollection
+    .first()
+    .bandNames()
+);
+
+
+// ============================================================================
+// 15. PRE / POST MEANS
+// ============================================================================
+
+var pre =
+    annualCollection
+      .filter(
+        ee.Filter.gte(
+          'year',
+          2015
+        )
+      )
+      .filter(
+        ee.Filter.lte(
+          'year',
+          2018
+        )
+      )
+      .mean();
+
+
+var post =
+    annualCollection
+      .filter(
+        ee.Filter.gte(
+          'year',
+          2019
+        )
+      )
+      .filter(
+        ee.Filter.lte(
+          'year',
+          2025
+        )
+      )
+      .mean();
+
+
+// ============================================================================
+// 16. CHANGE MAPS
+// ============================================================================
+
+var deltaNDVI =
+    post
+      .select('NDVI')
+      .subtract(
+        pre.select('NDVI')
+      )
+      .rename(
+        'delta_NDVI'
+      );
+
+
+var deltaET =
+    post
+      .select('ET')
+      .subtract(
+        pre.select('ET')
+      )
+      .rename(
+        'delta_ET'
+      );
+
+
+var deltaLST =
+    post
+      .select('LST')
+      .subtract(
+        pre.select('LST')
+      )
+      .rename(
+        'delta_LST'
+      );
+
+
+var deltaP =
+    post
+      .select('P')
+      .subtract(
+        pre.select('P')
+      )
+      .rename(
+        'delta_P'
+      );
+
+
+var deltaPET =
+    post
+      .select('PET')
+      .subtract(
+        pre.select('PET')
+      )
+      .rename(
+        'delta_PET'
+      );
+
+
+var deltaWBP =
+    post
+      .select('WBP')
+      .subtract(
+        pre.select('WBP')
+      )
+      .rename(
+        'delta_WBP'
+      );
+
+
+var deltaEI =
+    post
+      .select('EI')
+      .subtract(
+        pre.select('EI')
+      )
+      .rename(
+        'delta_EI'
+      );
+
+
+var deltaAI =
+    post
+      .select('AI')
+      .subtract(
+        pre.select('AI')
+      )
+      .rename(
+        'delta_AI'
+      );
+
+
+var deltaAlbedo =
+    post
+      .select('albedo')
+      .subtract(
+        pre.select('albedo')
+      )
+      .rename(
+        'delta_albedo'
+      );
+
+
+// ============================================================================
+// 17. MAP DISPLAY
+// ============================================================================
+
+Map.addLayer(
+  deltaNDVI,
+  {
+    min: -0.10,
+    max: 0.10,
+    palette: [
+      'blue',
+      'white',
+      'green'
+    ]
+  },
+  'ΔNDVI'
+);
+
+
+Map.addLayer(
+  deltaET,
+  {
+    min: -100,
+    max: 100,
+    palette: [
+      'brown',
+      'white',
+      'green'
+    ]
+  },
+  'ΔET'
+);
+
+
+Map.addLayer(
+  deltaLST,
+  {
+    min: -3,
+    max: 3,
+    palette: [
+      'blue',
+      'white',
+      'red'
+    ]
+  },
+  'ΔLST'
+);
+
+
+Map.addLayer(
+  deltaWBP,
+  {
+    min: -100,
+    max: 100,
+    palette: [
+      'blue',
+      'white',
+      'red'
+    ]
+  },
+  'ΔWBP = ET-P'
+);
+
+
+Map.addLayer(
+  deltaEI,
+  {
+    min: -0.2,
+    max: 0.2,
+    palette: [
+      'blue',
+      'white',
+      'red'
+    ]
+  },
+  'ΔEI'
+);
+
+
+Map.addLayer(
+  deltaAI,
+  {
+    min: -0.5,
+    max: 0.5,
+    palette: [
+      'blue',
+      'white',
+      'red'
+    ]
+  },
+  'ΔAI'
+);
+
+
+// ============================================================================
+// 18. EXPORT FUNCTION
+// ============================================================================
+
+function exportMap(
+    image,
+    description,
+    scale
+) {
+
+  Export.image.toDrive({
+
+    image: image,
+
+    description:
+      description,
+
+    folder:
+      EXPORT_FOLDER,
+
+    region:
+      roi,
+
+    scale:
+      scale,
+
+    maxPixels:
+      1e13,
+
+    fileFormat:
+      'GeoTIFF',
+
+    formatOptions: {
+      cloudOptimized:
+        true
+    }
+
+  });
+}
+
+
+// ============================================================================
+// 19. EXPORT CORE MAPS
+// ============================================================================
+
+// Treatment
+exportMap(
+  candidateTreatment.toByte(),
+  'OLDPAPER_Candidate_Woody_Establishment_10m',
+  10
+);
+
+
+// Treatment intensity
+exportMap(
+  treatmentNDVI,
+  'OLDPAPER_Treatment_Intensity_250m',
+  250
+);
+
+
+// NDVI
+exportMap(
+  deltaNDVI,
+  'OLDPAPER_Delta_NDVI_2019_2025_vs_2015_2018_250m',
+  250
+);
+
+
+// ET
+exportMap(
+  deltaET,
+  'OLDPAPER_Delta_ET_2019_2025_vs_2015_2018_500m',
+  500
+);
+
+
+// LST
+exportMap(
+  deltaLST,
+  'OLDPAPER_Delta_LST_2019_2025_vs_2015_2018_1km',
+  1000
+);
+
+
+// Precipitation
+exportMap(
+  deltaP,
+  'OLDPAPER_Delta_P_2019_2025_vs_2015_2018',
+  5000
+);
+
+
+// PET
+exportMap(
+  deltaPET,
+  'OLDPAPER_Delta_PET_FAO_PM_2019_2025_vs_2015_2018',
+  11132
+);
+
+
+// WBP
+exportMap(
+  deltaWBP,
+  'OLDPAPER_Delta_WBP_ETminusP_500m',
+  500
+);
+
+
+// EI
+exportMap(
+  deltaEI,
+  'OLDPAPER_Delta_EI_EToverP_500m',
+  500
+);
+
+
+// AI
+exportMap(
+  deltaAI,
+  'OLDPAPER_Delta_AI_PEToverP',
+  11132
+);
+
+
+// Albedo
+exportMap(
+  deltaAlbedo,
+  'OLDPAPER_Delta_Albedo_500m',
+  500
+);
+
+
+// ============================================================================
+// 20. CONTEXT MAPS
+// ============================================================================
+
+exportMap(
+  pre.select('P'),
+  'OLDPAPER_Mean_Precipitation_2015_2018',
+  5000
+);
+
+
+exportMap(
+  pre.select('PET'),
+  'OLDPAPER_Mean_PET_FAO_PM_2015_2018',
+  11132
+);
+
+
+exportMap(
+  pre.select('AI'),
+  'OLDPAPER_Aridity_Index_Baseline',
+  11132
+);
+
+
+// ============================================================================
+// 21. FINAL DIAGNOSTICS
+// ============================================================================
+
+print('================================================');
+print('FINAL OLD-PAPER MAP PRODUCTION');
+print('================================================');
+
+print(
+  'Annual collection size:',
+  annualCollection.size()
+);
+
+print(
+  'First annual image bands:',
+  annualCollection
+    .first()
+    .bandNames()
+);
+
+print(
+  'Pre-period bands:',
+  pre.bandNames()
+);
+
+print(
+  'Post-period bands:',
+  post.bandNames()
+);
+
+print(
+  'ΔNDVI:',
+  deltaNDVI
+);
+
+print(
+  'ΔET:',
+  deltaET
+);
+
+print(
+  'ΔLST:',
+  deltaLST
+);
+
+print(
+  'ΔWBP:',
+  deltaWBP
+);
+
+print(
+  'ΔEI:',
+  deltaEI
+);
+
+print(
+  'ΔAI:',
+  deltaAI
+);
+
+print('================================================');
+print('EXPORT TASKS CREATED');
+print('================================================');
+
+// ============================================================================
+// ENVIRONMENTAL RESPONSE MAPS
+// 2018 BASELINE | 2025 | 2018–2025 CHANGE
+// OLD GLI PAPER
+// ============================================================================
+
+// -----------------------------------------------------------------------------
+// 1. SELECT 2018 AND 2025 FROM THE ANNUAL COLLECTION
+// -----------------------------------------------------------------------------
+
+var annual2018 = annualCollection
+  .filter(ee.Filter.eq('year', 2018))
+  .first();
+
+var annual2025 = annualCollection
+  .filter(ee.Filter.eq('year', 2025))
+  .first();
+
+print('2018 environmental image:', annual2018);
+print('2025 environmental image:', annual2025);
+
+
+// ============================================================================
+// 2. NDVI
+// ============================================================================
+
+var NDVI_2018 = annual2018.select('NDVI');
+var NDVI_2025 = annual2025.select('NDVI');
+var NDVI_change_2018_2025 = NDVI_2025.subtract(NDVI_2018)
+  .rename('NDVI_change_2018_2025');
+
+
+// ============================================================================
+// 3. ET
+// ============================================================================
+
+var ET_2018 = annual2018.select('ET');
+var ET_2025 = annual2025.select('ET');
+var ET_change_2018_2025 = ET_2025.subtract(ET_2018)
+  .rename('ET_change_2018_2025');
+
+
+// ============================================================================
+// 4. LST
+// ============================================================================
+
+var LST_2018 = annual2018.select('LST');
+var LST_2025 = annual2025.select('LST');
+var LST_change_2018_2025 = LST_2025.subtract(LST_2018)
+  .rename('LST_change_2018_2025');
+
+
+// ============================================================================
+// 5. WBP = ET - P
+// ============================================================================
+
+var WBP_2018 = annual2018.select('WBP');
+var WBP_2025 = annual2025.select('WBP');
+
+var WBP_change_2018_2025 = WBP_2025.subtract(WBP_2018)
+  .rename('WBP_change_2018_2025');
+
+
+// ============================================================================
+// 6. EI = ET / P
+// ============================================================================
+
+var EI_2018 = annual2018.select('EI');
+var EI_2025 = annual2025.select('EI');
+
+var EI_change_2018_2025 = EI_2025.subtract(EI_2018)
+  .rename('EI_change_2018_2025');
+
+
+// ============================================================================
+// 7. AI = PET / P
+// ============================================================================
+
+var AI_2018 = annual2018.select('AI');
+var AI_2025 = annual2025.select('AI');
+
+var AI_change_2018_2025 = AI_2025.subtract(AI_2018)
+  .rename('AI_change_2018_2025');
+
+
+// ============================================================================
+// 8. ALBEDO
+// ============================================================================
+
+var albedo_2018 = annual2018.select('albedo');
+var albedo_2025 = annual2025.select('albedo');
+
+var albedo_change_2018_2025 = albedo_2025
+  .subtract(albedo_2018)
+  .rename('albedo_change_2018_2025');
+
+
+// ============================================================================
+// MAP DISPLAY — OPTIONAL
+// ============================================================================
+
+Map.addLayer(
+  NDVI_2018,
+  {min: 0, max: 0.8},
+  'NDVI 2018'
+);
+
+Map.addLayer(
+  NDVI_2025,
+  {min: 0, max: 0.8},
+  'NDVI 2025'
+);
+
+Map.addLayer(
+  NDVI_change_2018_2025,
+  {min: -0.3, max: 0.3},
+  'NDVI Change 2018-2025'
+);
+
+
+// ============================================================================
+// EXPORT FUNCTION
+// ============================================================================
+
+function exportEnvironmentalMap(image, name, scale) {
+
+  Export.image.toDrive({
+    image: image,
+    description: name,
+    folder: 'OLD_PAPER_ENVIRONMENTAL_MAPS',
+    fileNamePrefix: name,
+    region: roi,
+    scale: scale,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13
+  });
+
+}
+
+
+// ============================================================================
+// NDVI EXPORTS — 250 m
+// ============================================================================
+
+exportEnvironmentalMap(
+  NDVI_2018,
+  'OLDPAPER_NDVI_2018',
+  250
+);
+
+exportEnvironmentalMap(
+  NDVI_2025,
+  'OLDPAPER_NDVI_2025',
+  250
+);
+
+exportEnvironmentalMap(
+  NDVI_change_2018_2025,
+  'OLDPAPER_NDVI_CHANGE_2018_2025',
+  250
+);
+
+
+// ============================================================================
+// ET EXPORTS — 500 m
+// ============================================================================
+
+exportEnvironmentalMap(
+  ET_2018,
+  'OLDPAPER_ET_2018',
+  500
+);
+
+exportEnvironmentalMap(
+  ET_2025,
+  'OLDPAPER_ET_2025',
+  500
+);
+
+exportEnvironmentalMap(
+  ET_change_2018_2025,
+  'OLDPAPER_ET_CHANGE_2018_2025',
+  500
+);
+
+
+// ============================================================================
+// LST EXPORTS — 1 km
+// ============================================================================
+
+exportEnvironmentalMap(
+  LST_2018,
+  'OLDPAPER_LST_2018',
+  1000
+);
+
+exportEnvironmentalMap(
+  LST_2025,
+  'OLDPAPER_LST_2025',
+  1000
+);
+
+exportEnvironmentalMap(
+  LST_change_2018_2025,
+  'OLDPAPER_LST_CHANGE_2018_2025',
+  1000
+);
+
+
+// ============================================================================
+// WBP EXPORTS — 500 m
+// ============================================================================
+
+exportEnvironmentalMap(
+  WBP_2018,
+  'OLDPAPER_WBP_2018',
+  500
+);
+
+exportEnvironmentalMap(
+  WBP_2025,
+  'OLDPAPER_WBP_2025',
+  500
+);
+
+exportEnvironmentalMap(
+  WBP_change_2018_2025,
+  'OLDPAPER_WBP_CHANGE_2018_2025',
+  500
+);
+
+
+// ============================================================================
+// EI EXPORTS — 500 m
+// ============================================================================
+
+exportEnvironmentalMap(
+  EI_2018,
+  'OLDPAPER_EI_2018',
+  500
+);
+
+exportEnvironmentalMap(
+  EI_2025,
+  'OLDPAPER_EI_2025',
+  500
+);
+
+exportEnvironmentalMap(
+  EI_change_2018_2025,
+  'OLDPAPER_EI_CHANGE_2018_2025',
+  500
+);
+
+
+// ============================================================================
+// AI EXPORTS — PET/P SUPPORT
+// ============================================================================
+
+exportEnvironmentalMap(
+  AI_2018,
+  'OLDPAPER_AI_2018',
+  5000
+);
+
+exportEnvironmentalMap(
+  AI_2025,
+  'OLDPAPER_AI_2025',
+  5000
+);
+
+exportEnvironmentalMap(
+  AI_change_2018_2025,
+  'OLDPAPER_AI_CHANGE_2018_2025',
+  5000
+);
+
+
+// ============================================================================
+// ALBEDO EXPORTS — 500 m
+// ============================================================================
+
+exportEnvironmentalMap(
+  albedo_2018,
+  'OLDPAPER_ALBEDO_2018',
+  500
+);
+
+exportEnvironmentalMap(
+  albedo_2025,
+  'OLDPAPER_ALBEDO_2025',
+  500
+);
+
+exportEnvironmentalMap(
+  albedo_change_2018_2025,
+  'OLDPAPER_ALBEDO_CHANGE_2018_2025',
+  500
+);
+
+
+// ============================================================================
+// EXISTING MAIN PRE/POST CHANGE MAPS
+// ============================================================================
+
+exportEnvironmentalMap(
+  deltaNDVI,
+  'OLDPAPER_DELTA_NDVI_PRE_POST',
+  250
+);
+
+exportEnvironmentalMap(
+  deltaET,
+  'OLDPAPER_DELTA_ET_PRE_POST',
+  500
+);
+
+exportEnvironmentalMap(
+  deltaLST,
+  'OLDPAPER_DELTA_LST_PRE_POST',
+  1000
+);
+
+exportEnvironmentalMap(
+  deltaWBP,
+  'OLDPAPER_DELTA_WBP_PRE_POST',
+  500
+);
+
+exportEnvironmentalMap(
+  deltaEI,
+  'OLDPAPER_DELTA_EI_PRE_POST',
+  500
+);
+
+exportEnvironmentalMap(
+  deltaAI,
+  'OLDPAPER_DELTA_AI_PRE_POST',
+  5000
+);
+
+
+// ============================================================================
+// CONFIRM
+// ============================================================================
+
+print('==============================================');
+print('ENVIRONMENTAL MAP EXPORTS CREATED');
+print('==============================================');
+
+print('NDVI: 2018 | 2025 | change');
+print('ET: 2018 | 2025 | change');
+print('LST: 2018 | 2025 | change');
+print('WBP: 2018 | 2025 | change');
+print('EI: 2018 | 2025 | change');
+print('AI: 2018 | 2025 | change');
+print('Albedo: 2018 | 2025 | change');
+print('Pre/Post analytical change maps also exported.');
