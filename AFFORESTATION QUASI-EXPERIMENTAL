@@ -1,0 +1,425 @@
+// ============================================================================
+// AFFORESTATION QUASI-EXPERIMENTAL PIPELINE, EASY VERSION (BMER, GLI 2019-2025)
+// ============================================================================
+
+// ---------- SETTINGS (edit only this block) ----------
+var STEP = 3;                                        // 1, 2, or 3 (3 = re-export cluster IDs only)
+var ASSET_ROOT = 'projects/ee-yosef369/assets/aff/'; // folder must exist
+var DRIVE_FOLDER = 'Afforestation_Analysis';
+var CFG = {
+  startYear: 2015, endYear: 2025, onset: 2019, preEnd: 2018,
+  extPreStart: 2001,       // earliest year with all four MODIS products
+  minPostYears: 3,         // TO CONFIRM: post years that must be forest
+  requireEndState: true,   // TO CONFIRM: must also be forest in endYear
+  minIntensity: 0,         // Sec. 2.4: exposed = W > 0
+  bufferM: 1000,           // TO CONFIRM: buffer around exposed pixels (m)
+  wet: [3, 10],            // Sec. 2.1: rainy season Mar-Oct
+  dryA: [11, 12], dryB: [1, 2],
+  basinLevel: 12,          // HydroSHEDS level (1-12)
+  minInsideFrac: 0.9,      // TO CONFIRM: keep basins >= 90% inside the BMER
+  outcomes: ['NDVI', 'ET', 'Albedo', 'LST'],
+  tilesX: 3, tilesY: 3,    // study area is split into tilesX x tilesY pieces
+  testTile: 4              // tile index printed to the console as a quick check
+};
+CFG.stage = STEP;
+CFG.assetRoot = ASSET_ROOT;
+CFG.tileScale = 8;
+
+// Dynamic World classes -> forest / cropland / rangeland.  TO CONFIRM against Table S2.
+var DW_FOREST = [1];
+var DW_CROP   = [4];
+var DW_RANGE  = [2, 3, 5, 7];
+var DW_OTHER  = [0, 6, 8];      // water, built, snow/ice (excluded)
+
+var MAIN_YEARS = [];
+for (var yy = CFG.startYear; yy <= CFG.endYear; yy++) { MAIN_YEARS.push(yy); }
+var EXT_YEARS = [];
+for (var ye = CFG.extPreStart; ye < CFG.startYear; ye++) { EXT_YEARS.push(ye); }
+
+var studyArea = ee.FeatureCollection('projects/ee-yosef369/assets/Study_area');
+var roi = studyArea.geometry();
+Map.centerObject(roi, 8);
+Map.addLayer(roi, {color: 'red'}, 'Study Area', false);
+
+var DW_PROJ = ee.Projection('EPSG:4326').atScale(10);
+
+// Area-mean aggregation onto a target grid (source projection declared first).
+function toGrid(img, srcProj, targetProj) {
+  return img.toFloat()
+    .setDefaultProjection(srcProj)
+    .reduceResolution({reducer: ee.Reducer.mean(), maxPixels: 65536})
+    .reproject(targetProj);
+}
+
+// ===============================
+// 2. STAGE 1: 10 m LAYERS FROM ANNUAL MODAL DYNAMIC WORLD CLASSES (Sec. 2.2-2.3)
+// ===============================
+function inList(img, list) {
+  var m = ee.Image(0);
+  list.forEach(function(c) { m = m.or(img.eq(c)); });
+  return m;
+}
+
+function buildLayers10() {
+  var dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').filterBounds(roi);
+  function modalLabel(y) {
+    var s0 = ee.Date.fromYMD(y, 1, 1);
+    return dw.filterDate(s0, s0.advance(1, 'year')).select('label').mode();
+  }
+  // DW starts mid-2015, so 2015 is a partial year
+  var forestFlags = ee.ImageCollection.fromImages(ee.List(MAIN_YEARS).map(function(y) {
+    y = ee.Number(y);
+    return inList(modalLabel(y), DW_FOREST).rename('forest').set('year', y);
+  }));
+  var otherFlags = ee.ImageCollection.fromImages(ee.List(MAIN_YEARS).map(function(y) {
+    y = ee.Number(y);
+    return inList(modalLabel(y), DW_OTHER).rename('other').set('year', y);
+  }));
+
+  var preForestAny = forestFlags.filter(ee.Filter.lte('year', CFG.preEnd)).max();
+  var nonForestPre = preForestAny.not();
+  var postCount    = forestFlags.filter(ee.Filter.gte('year', CFG.onset)).sum();
+  var endForest    = ee.Image(forestFlags.filter(ee.Filter.eq('year', CFG.endYear)).first());
+  var persistent = postCount.gte(CFG.minPostYears);
+  if (CFG.requireEndState) { persistent = persistent.and(endForest); }
+
+  // 10 m treatment: non-forest before 2019, persistent forest afterwards
+  var treat10 = nonForestPre.and(persistent).rename('treat');
+  // 10 m stable non-forest: never forest, never water/built in any year
+  var stable10 = forestFlags.max().not().and(otherFlags.max().not()).rename('stable');
+
+  // first post-onset year in which a treated 10 m cell is forest (description only)
+  var fyList = [];
+  for (var fy = CFG.onset; fy <= CFG.endYear; fy++) {
+    var fImg = ee.Image(forestFlags.filter(ee.Filter.eq('year', fy)).first());
+    fyList.push(ee.Image.constant(fy).toFloat().updateMask(fImg.and(treat10)).rename('first_year'));
+  }
+  var firstYear10 = ee.ImageCollection.fromImages(fyList).min().unmask(9999);  // 9999 = never
+
+  return ee.Image.cat([treat10.toFloat(), stable10.toFloat(), firstYear10.toFloat()]);
+}
+
+if (STEP === 1) {
+  Export.image.toAsset({
+    image: buildLayers10(), description: 'Step1_Layers10m',
+    assetId: ASSET_ROOT + 'layers10m', region: roi,
+    crs: 'EPSG:4326', scale: 10, maxPixels: 1e13
+  });
+  print('STEP 1 ready: open the Tasks tab, RUN "Step1_Layers10m", wait for the blue tick, then set STEP = 2.');
+}
+
+// ===============================
+// 3. OUTCOME PRODUCTS, NATIVE GRIDS, QA MASKS (Sec. 2.2)
+// ===============================
+var SRC = {
+  NDVI: {
+    id: 'MODIS/061/MOD13Q1', ref: 'NDVI', bands: ['NDVI'], sum: false,
+    prep: function(i) {
+      var v = i.select('NDVI').updateMask(i.select('SummaryQA').lte(1)).multiply(0.0001);
+      return v.rename('NDVI');
+    }
+  },
+  ET: {
+    id: 'MODIS/061/MOD16A2GF', ref: 'ET', bands: ['ET'], sum: true,
+    prep: function(i) {                        // gap-filled MOD16A2 (Table 1 to be updated)
+      var e = i.select('ET');
+      return e.updateMask(e.lte(32700)).multiply(0.1).rename('ET');
+    }
+  },
+  Albedo: {
+    id: 'MODIS/061/MCD43A3', ref: 'Albedo_WSA_shortwave', bands: ['Albedo'], sum: false,
+    prep: function(i) {
+      var a = i.select('Albedo_WSA_shortwave');
+      var q = i.select('BRDF_Albedo_Band_Mandatory_Quality_shortwave').lte(1);
+      return a.updateMask(q).multiply(0.001).rename('Albedo');
+    }
+  },
+  LST: {
+    id: 'MODIS/061/MOD11A2', ref: 'LST_Day_1km', bands: ['LST', 'LSTn'], sum: false,
+    prep: function(i) {
+      var d = i.select('LST_Day_1km');
+      var n = i.select('LST_Night_1km');
+      var qd = i.select('QC_Day').bitwiseAnd(3).lte(1).and(d.gt(0));
+      var qn = i.select('QC_Night').bitwiseAnd(3).lte(1).and(n.gt(0));
+      return ee.Image.cat([
+        d.updateMask(qd).multiply(0.02).subtract(273.15).rename('LST'),
+        n.updateMask(qn).multiply(0.02).subtract(273.15).rename('LSTn')
+      ]);
+    }
+  }
+};
+
+function gridProj(key) {
+  return ee.ImageCollection(SRC[key].id).first().select(SRC[key].ref).projection();
+}
+
+function seasonFilter(season) {
+  if (season === 'all') { return ee.Filter.calendarRange(1, 12, 'month'); }
+  if (season === 'wet') { return ee.Filter.calendarRange(CFG.wet[0], CFG.wet[1], 'month'); }
+  return ee.Filter.or(
+    ee.Filter.calendarRange(CFG.dryA[0], CFG.dryA[1], 'month'),
+    ee.Filter.calendarRange(CFG.dryB[0], CFG.dryB[1], 'month'));
+}
+
+function periodImage(key, y, season) {
+  var s = SRC[key];
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var col = ee.ImageCollection(s.id)
+    .filterDate(start, start.advance(1, 'year'))
+    .filter(seasonFilter(season))
+    .map(s.prep);
+  return (s.sum ? col.sum() : col.mean()).toFloat();
+}
+
+// ===============================
+// 4. HYDROCLIMATIC FORCING (Sec. 2.2)
+// ===============================
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY');
+var smap   = ee.ImageCollection('NASA/SMAP/SPL4SMGP/007');
+var era    = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR');
+var ERA_PROJ = era.first().select('temperature_2m').projection();
+
+// FAO-56 Penman-Monteith at monthly steps from ERA5-Land (G = 0).
+// Note: monthly-mean wind components and mean temperature slightly bias PET.
+function pmMonth(img) {
+  var t0   = ee.Date(img.get('system:time_start'));
+  var days = t0.advance(1, 'month').difference(t0, 'day');
+  var T    = img.select('temperature_2m').subtract(273.15);
+  var Td   = img.select('dewpoint_temperature_2m').subtract(273.15);
+  var es   = T.multiply(17.27).divide(T.add(237.3)).exp().multiply(0.6108);
+  var ea   = Td.multiply(17.27).divide(Td.add(237.3)).exp().multiply(0.6108);
+  var dlt  = es.multiply(4098).divide(T.add(237.3).pow(2));
+  var gam  = img.select('surface_pressure').divide(1000).multiply(0.000665);
+  var ws10 = img.select('u_component_of_wind_10m').pow(2)
+    .add(img.select('v_component_of_wind_10m').pow(2)).sqrt();
+  var u2   = ws10.multiply(0.748);
+  var rn   = img.select('surface_net_solar_radiation_sum')
+    .add(img.select('surface_net_thermal_radiation_sum'))
+    .divide(1e6).divide(days);                       // MJ m-2 day-1
+  var num  = dlt.multiply(rn).multiply(0.408)
+    .add(gam.multiply(900).divide(T.add(273)).multiply(u2).multiply(es.subtract(ea)));
+  var den  = dlt.add(gam.multiply(u2.multiply(0.34).add(1)));
+  var et0  = num.divide(den).max(0);
+  return ee.Image.cat([
+    et0.multiply(days).rename('PET'),
+    T.rename('t2m'), rn.rename('rn'),
+    es.subtract(ea).max(0).rename('vpd'), u2.rename('ws2')
+  ]).set('system:time_start', img.get('system:time_start'));
+}
+
+function forcingImages(y, season) {
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end = start.advance(1, 'year');
+  var sf = seasonFilter(season);
+  var P = chirps.filterDate(start, end).filter(sf).select('precipitation').sum().rename('P');
+  var pm = era.filterDate(start, end).filter(sf)
+    .select(['temperature_2m', 'dewpoint_temperature_2m', 'surface_pressure',
+             'u_component_of_wind_10m', 'v_component_of_wind_10m',
+             'surface_net_solar_radiation_sum', 'surface_net_thermal_radiation_sum'])
+    .map(pmMonth);
+  var PET = pm.select('PET').sum().rename('PET');
+  var SM = smap.filterDate(start, end).filter(sf).select('sm_rootzone')
+    .mean().multiply(100).rename('SM');        // masked (not 0) if no data
+  var others = pm.select(['t2m', 'rn', 'vpd', 'ws2']).mean();
+  return {P: P, PET: PET, SM: SM, others: others};
+}
+
+// ===============================
+// 6. YEARLY VARIABLES FOR ONE OUTCOME GRID
+// ===============================
+function yearImage(key, y) {
+  var s = SRC[key];
+  var all = periodImage(key, y, 'all');
+  var wet = periodImage(key, y, 'wet').select([s.bands[0]]).rename(s.bands[0] + '_wet');
+  var dry = periodImage(key, y, 'dry').select([s.bands[0]]).rename(s.bands[0] + '_dry');
+  var fAll = forcingImages(y, 'all');
+  var fWet = forcingImages(y, 'wet');
+  var fDry = forcingImages(y, 'dry');
+  return ee.Image.cat([
+    all, wet, dry,
+    fAll.P, fAll.SM, fAll.PET, fAll.others,
+    fWet.P.rename('P_wet'), fWet.PET.rename('PET_wet'),
+    fDry.P.rename('P_dry'), fDry.PET.rename('PET_dry')
+  ]).toFloat();
+}
+
+// ===============================
+// 5. STEP 2: ONE GRID STACK PER OUTCOME (static + all years)
+// ===============================
+var dem = ee.Image('USGS/SRTMGL1_003');
+var slope30 = ee.Terrain.slope(dem);
+var DEM_PROJ = dem.projection();
+
+function buildGrid(key) {
+  var L10  = ee.Image(ASSET_ROOT + 'layers10m');
+  var P10  = L10.select('treat').projection();
+  var proj = gridProj(key);
+
+  var W   = toGrid(L10.select('treat'), P10, proj).rename('W');
+  var stb = toGrid(L10.select('stable'), P10, proj);
+  var fy  = L10.select('first_year').setDefaultProjection(P10)
+    .reduceResolution({reducer: ee.Reducer.min(), maxPixels: 65536})
+    .reproject(proj);
+  fy = fy.updateMask(fy.lt(9999)).rename('first_year');
+
+  var exposed = W.gt(CFG.minIntensity);
+  var candidate = stb.gte(0.999).and(W.eq(0));
+  var near = exposed.focal_max({radius: CFG.bufferM, units: 'meters', kernelType: 'circle'});
+  var comparison = candidate.and(near.not());
+  var group = ee.Image(0).where(exposed, 1)
+    .updateMask(exposed.or(comparison)).rename('group');
+
+  var base = [];
+  ['NDVI', 'LST', 'ET', 'Albedo'].forEach(function(k) {
+    var b = ee.ImageCollection(SRC[k].id)
+      .filterDate(CFG.startYear + '-01-01', (CFG.preEnd + 1) + '-01-01')
+      .map(SRC[k].prep);
+    var m = (SRC[k].sum ? b.sum().divide(CFG.preEnd - CFG.startYear + 1) : b.mean())
+      .select([SRC[k].bands[0]]).rename('base_' + k);
+    base.push(toGrid(m, gridProj(k), proj));
+  });
+  var pBase = chirps.filterDate(CFG.startYear + '-01-01', (CFG.preEnd + 1) + '-01-01')
+    .select('precipitation').sum().divide(CFG.preEnd - CFG.startYear + 1).rename('base_P');
+  var elev = toGrid(dem, DEM_PROJ, proj).rename('elevation');
+  var slp  = toGrid(slope30, DEM_PROJ, proj).rename('slope');
+  var pc = ee.Image.pixelCoordinates(proj).rename(['px', 'py']);
+  var cc = ee.Image.pixelCoordinates(ERA_PROJ);
+  var cluster = cc.select('x').floor().multiply(10000).add(cc.select('y').floor()).rename('cluster_id');
+
+  var staticStack = ee.Image.cat([group, candidate.rename('candidate'), W, fy, elev, slp, pBase]
+    .concat(base).concat([pc, cluster])).toFloat();
+
+  // yearly bands, suffixed _YYYY
+  var yearly = MAIN_YEARS.map(function(y) {
+    var im = yearImage(key, y);
+    return im.rename(im.bandNames().map(function(n) { return ee.String(n).cat('_' + y); }));
+  });
+  var ext = EXT_YEARS.map(function(y) {
+    var im = periodImage(key, y, 'all').select(SRC[key].bands);
+    return im.rename(im.bandNames().map(function(n) { return ee.String(n).cat('_' + y); }));
+  });
+
+  var stack = ee.Image.cat([staticStack].concat(yearly).concat(ext)).toFloat();
+  return {stack: stack, group: group.clip(roi), exposed: exposed, candidate: candidate,
+          comparison: comparison, proj: proj};
+}
+
+// ===============================
+// 7. TILES
+// ===============================
+var bb = roi.bounds().getInfo().coordinates[0];
+var X0 = bb[0][0], Y0 = bb[0][1], X1 = bb[2][0], Y1 = bb[2][1];
+var TILES = [];
+for (var ti = 0; ti < CFG.tilesX; ti++) {
+  for (var tj = 0; tj < CFG.tilesY; tj++) {
+    var rect = ee.Geometry.Rectangle([
+      X0 + ti * (X1 - X0) / CFG.tilesX, Y0 + tj * (Y1 - Y0) / CFG.tilesY,
+      X0 + (ti + 1) * (X1 - X0) / CFG.tilesX, Y0 + (tj + 1) * (Y1 - Y0) / CFG.tilesY], null, false);
+    TILES.push(rect.intersection(roi, ee.ErrorMargin(10)));
+  }
+}
+
+function nCount(img, proj, region) {
+  return ee.Number(img.rename('n').unmask(0).reduceRegion({
+    reducer: ee.Reducer.sum().unweighted(), geometry: region,
+    crs: proj, scale: proj.nominalScale(), maxPixels: 1e13, tileScale: CFG.tileScale
+  }).get('n'));
+}
+
+function countFeature(G, key, idx) {
+  return ee.Feature(null, {
+    outcome: key, tile: idx,
+    exposed: nCount(G.exposed, G.proj, TILES[idx]),
+    candidate_comparison: nCount(G.candidate, G.proj, TILES[idx]),
+    comparison_after_buffer: nCount(G.comparison, G.proj, TILES[idx])
+  });
+}
+
+// ===============================
+// 8. STEP 2: MAP, CONSOLE CHECK, CSV EXPORTS
+// ===============================
+if (STEP === 2) {
+  // map layers (render only the visible area, so they are light)
+  var GM = buildGrid(CFG.outcomes[0]);
+  Map.addLayer(GM.group.selfMask(), {min: 0, max: 1, palette: ['FFD700', '00A000']},
+    CFG.outcomes[0] + ' grid: comparison (yellow) / exposed (green)');
+  Map.addLayer(GM.stack.select('W').updateMask(GM.stack.select('W').gt(0)).clip(roi),
+    {min: 0, max: 1, palette: ['white', 'lightgreen', 'darkgreen']}, 'Woody-establishment intensity W', false);
+
+  // console check on ONE tile (fast feedback before launching the exports)
+  print('Tile bounds (test tile ' + CFG.testTile + '):', TILES[CFG.testTile].bounds());
+  print(CFG.outcomes[0] + ' counts in test tile:', countFeature(GM, CFG.outcomes[0], CFG.testTile));
+
+  CFG.outcomes.forEach(function(key) {
+    var G = buildGrid(key);
+    var countList = [];
+    TILES.forEach(function(tile, idx) {
+      var rows = G.stack.updateMask(G.group.mask()).sample({
+        region: tile, projection: G.proj, scale: G.proj.nominalScale(),
+        geometries: false, dropNulls: false, tileScale: CFG.tileScale
+      });
+      Export.table.toDrive({
+        collection: rows, description: 'Pix_' + key + '_t' + idx,
+        folder: DRIVE_FOLDER, fileFormat: 'CSV'
+      });
+      countList.push(countFeature(G, key, idx));
+    });
+    Export.table.toDrive({
+      collection: ee.FeatureCollection(countList), description: 'Counts_' + key,
+      folder: DRIVE_FOLDER, fileFormat: 'CSV'
+    });
+  });
+
+  // Budyko inputs: HydroSHEDS sub-basins from the GEE catalog (WWF/HydroSHEDS/v1/Basins)
+  var allBasins = ee.FeatureCollection('WWF/HydroSHEDS/v1/Basins/hybas_' + CFG.basinLevel)
+    .filterBounds(roi)
+    .map(function(f) {
+      var g = f.geometry();
+      var a = g.area(100);
+      return f.set({area_km2: a.divide(1e6),
+                    inside_frac: g.intersection(roi, 100).area(100).divide(a)});
+    });
+  var subBasins = allBasins.filter(ee.Filter.gte('inside_frac', CFG.minInsideFrac))
+    .select(['HYBAS_ID', 'area_km2', 'inside_frac']);
+  print('Basins touching the BMER:', allBasins.size());
+  print('Basins kept (N for Sec. 2.6):', subBasins.size());
+  Map.addLayer(subBasins.style({color: '0000FF', fillColor: '00000000', width: 1}), {}, 'Budyko sub-basins', false);
+
+  var etScale = gridProj('ET').nominalScale();
+  var climYears = MAIN_YEARS.map(function(y) {
+    var f = forcingImages(y, 'all');
+    var img = ee.Image.cat([f.P, periodImage('ET', y, 'all'), f.PET]).toFloat();
+    return img.reduceRegions({collection: subBasins, reducer: ee.Reducer.mean(),
+      scale: etScale, tileScale: 4}).map(function(feat) { return feat.set('year', y); });
+  });
+  Export.table.toDrive({
+    collection: ee.FeatureCollection(climYears).flatten(),
+    description: 'Budyko_Climate_Annual', folder: DRIVE_FOLDER, fileFormat: 'CSV'
+  });
+  // woody fraction per basin straight from the 10 m asset (no regridding)
+  var treatAsset = ee.Image(ASSET_ROOT + 'layers10m').select('treat');
+  Export.table.toDrive({
+    collection: treatAsset.reduceRegions({collection: subBasins, reducer: ee.Reducer.mean(),
+      scale: 30, tileScale: 8}).select(['HYBAS_ID', 'area_km2', 'inside_frac', 'mean']),
+    description: 'Budyko_Woody', folder: DRIVE_FOLDER, fileFormat: 'CSV'
+  });
+  print('STEP 2 ready: open the Tasks tab and click "Run all".');
+}
+
+// ===============================
+// 9. STEP 3: WECLUSTER IDs ONLY (small, fast). Use after the cluster_id fix.
+// ===============================
+if (STEP === 3) {
+  CFG.outcomes.forEach(function(key) {
+    var G = buildGrid(key);
+    var small = G.stack.select(['px', 'py', 'cluster_id']).updateMask(G.group.mask());
+    TILES.forEach(function(tile, idx) {
+      Export.table.toDrive({
+        collection: small.sample({region: tile, projection: G.proj, scale: G.proj.nominalScale(),
+          geometries: false, dropNulls: false, tileScale: CFG.tileScale}),
+        description: 'Cluster_' + key + '_t' + idx, folder: DRIVE_FOLDER, fileFormat: 'CSV'
+      });
+    });
+  });
+  print('STEP 3 ready: Tasks tab > Run all (cluster IDs only).');
+}
