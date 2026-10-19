@@ -1,0 +1,73 @@
+ Overview
+This repository contains Google Earth Engine (GEE) scripts and supporting
+code for assessing woody-cover expansion and associated vegetation,
+land-surface temperature, and hydrological responses in the Bale Mountains
+Eco-Region (BMER), Ethiopia.
+
+The research evaluates satellite-observed land-cover change and environmental
+responses during 2015–2025, with particular attention to Ethiopia's Green
+Legacy Initiative (GLI), launched in 2019.
+
+## Study Area
+The study focuses on the Bale Mountains Eco-Region, southeastern Ethiopia.
+## Research Objectives
+1. Map satellite-detected woody-cover expansion.
+2. Evaluate vegetation greenness using NDVI.
+3. Assess evapotranspiration (ET) responses.
+4. Examine land-surface temperature (LST) changes.
+5. Evaluate water-balance and Budyko relationships.
+6. Develop and validate aboveground biomass estimates using GEDI,
+   optical satellite data, and Sentinel-1 SAR.
+7. Quantify environmental associations using matched comparisons
+   and Difference-in-Differences analyses.
+
+## Data Sources
+
+The workflow uses satellite and environmental datasets, including:
+
+- Google Dynamic World
+- MODIS vegetation indices
+- MODIS evapotranspiration
+- MODIS land-surface temperature
+- Sentinel-1 SAR
+- Sentinel-2 surface reflectance
+- GEDI aboveground biomass products
+- Precipitation and other climate datasets
+
+Exact dataset versions, date ranges, quality filters, and processing
+steps will be documented in the corresponding scripts.
+
+## Software
+
+- Google Earth Engine JavaScript API
+- R for statistical analysis and visualization
+- Python for data processing and analysis, where applicable
+
+## Repository Organization
+
+Scripts will be organized by analytical workflow:
+
+- `01_woody_cover/` — woody-cover mapping and validation
+- `02_vegetation_climate/` — vegetation and climate analysis
+- `03_difference_in_differences/` — NDVI, ET, and LST analyses
+- `04_hydrological_analysis/` — water balance and Budyko analysis
+- `05_aboveground_biomass/` — GEDI and Random Forest workflows
+- `06_validation/` — independent validation and sensitivity analyses
+- `docs/` — methods, data sources, and reproducibility notes
+
+## Data and Reproducibility
+
+Some scripts may reference private Google Earth Engine assets.
+Access to these assets is not automatically provided by this repository.
+
+Public dataset identifiers, processing parameters, and required inputs
+will be documented to support reproducibility.
+
+## Citation
+
+Citation information will be added when the associated manuscript
+is published.
+
+## Contact
+
+Yosef Ermiyas Bergene
