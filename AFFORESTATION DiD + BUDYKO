@@ -1,0 +1,568 @@
+// ============================================================
+// AFFORESTATION DiD + BUDYKO
+// PET: FAO-56 Penman–Monteith from ERA5-Land (monthly)
+// Treatment: 10 m intensity → native outcome grid
+// Panel: fixed pixels (treated OR control), all years
+// Clusters: ERA5-Land cell (climate_cluster) + HydroSHEDS L7
+// Budyko: HydroSHEDS L12, ≥90% inside BMER; ET−P in R
+// Seasons: wet = Jun–Sep; dry = Oct–May
+// No MOD16 PET, no CWD, no SMAP zero-fill, no N_initial/N_final
+// ============================================================
+
+// ===============================
+// USER SETTINGS
+// ===============================
+var OUTCOME_GRID = 'NDVI';   // 'NDVI' | 'ET' | 'Albedo' | 'LST'
+var INTENSITY_THRESH = 0.10; // exposed if intensity ≥ 0.10
+var BUFFER_METERS = 500;     // m buffer around exposed for comparison
+var DW_SCALE = 10;           // Dynamic World scale (m)
+var START_YEAR = 2010;
+var END_YEAR   = 2025;
+var TILE_DEG   = 0.5;
+
+// Optional: your 10 m intensity asset (band 0 = fraction 0–1). null = build from DW
+var intensityAssetId = null; // e.g. 'projects/ee-yosef369/assets/expansion_intensity_10m'
+
+// ===============================
+// 0. STUDY AREA
+// ===============================
+var studyArea = ee.FeatureCollection('projects/ee-yosef369/assets/Study_area');
+var roi = studyArea.geometry();
+Map.centerObject(roi, 8);
+Map.addLayer(roi, {color: 'red'}, 'Study Area');
+
+// ===============================
+// 1. OUTCOME NATIVE GRID
+// ===============================
+function outcomeProjection(name) {
+  name = ee.String(name);
+  var img = ee.Algorithms.If(
+    name.equals('NDVI'),
+    ee.ImageCollection('MODIS/061/MOD13Q1').first(),
+    ee.Algorithms.If(
+      name.equals('ET'),
+      ee.ImageCollection('MODIS/061/MOD16A2GF').first(),
+      ee.Algorithms.If(
+        name.equals('LST'),
+        ee.ImageCollection('MODIS/061/MOD11A2').first(),
+        ee.ImageCollection('MODIS/061/MCD43A3').first()
+      )
+    )
+  );
+  return ee.Image(img).projection();
+}
+
+var targetProj  = outcomeProjection(OUTCOME_GRID);
+var targetScale = targetProj.nominalScale();
+var targetCRS   = targetProj.crs();
+print('OUTCOME_GRID:', OUTCOME_GRID);
+print('Native scale (m):', targetScale);
+
+// ===============================
+// 2. TOPOGRAPHY
+// ===============================
+var dem = ee.Image('USGS/SRTMGL1_003');
+var elevation = dem.resample('bilinear')
+  .reproject({crs: targetCRS, scale: targetScale})
+  .rename('elevation');
+var slope = ee.Terrain.slope(dem).resample('bilinear')
+  .reproject({crs: targetCRS, scale: targetScale})
+  .rename('slope');
+
+// ===============================
+// 3. DYNAMIC WORLD — ANNUAL MODE + PERSISTENCE
+// ===============================
+var dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1');
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY');
+
+function dwAnnualMode(year) {
+  year = ee.Number(year);
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+  return dw.filterDate(start, end).select('label').mode()
+    .rename('dw_label')
+    .set('year', year);
+}
+
+// Pre 2015–2018: stable non-forest (label != trees=1) in ≥3 of 4 years
+var preModes = ee.ImageCollection.fromImages(
+  ee.List.sequence(2015, 2018).map(dwAnnualMode)
+);
+var preNonForestCount = preModes.map(function(img) {
+  return img.select('dw_label').neq(1);
+}).sum();
+var stableNonForestPre = preNonForestCount.gte(3)
+  .setDefaultProjection('EPSG:4326', null, DW_SCALE);
+
+// Post 2019–2025: persistent forest (label == 1) in ≥4 years
+var postModes = ee.ImageCollection.fromImages(
+  ee.List.sequence(2019, 2025).map(dwAnnualMode)
+);
+var postForestCount = postModes.map(function(img) {
+  return img.select('dw_label').eq(1);
+}).sum();
+var persistentForestPost = postForestCount.gte(4)
+  .setDefaultProjection('EPSG:4326', null, DW_SCALE);
+
+// Expansion at ~10 m
+var expansion10 = stableNonForestPre.and(persistentForestPost)
+  .setDefaultProjection('EPSG:4326', null, DW_SCALE);
+
+// ===============================
+// 4. TREATMENT INTENSITY (10 m → target grid)
+// ===============================
+var intensity10;
+if (intensityAssetId) {
+  intensity10 = ee.Image(intensityAssetId).select(0).rename('intensity')
+    .setDefaultProjection('EPSG:4326', null, DW_SCALE);
+} else {
+  intensity10 = expansion10
+    .rename('intensity')
+    .unmask(0)
+    .setDefaultProjection('EPSG:4326', null, DW_SCALE)
+    .reduceResolution({
+      reducer: ee.Reducer.mean(),
+      maxPixels: 65536
+    })
+    .reproject({crs: targetCRS, scale: targetScale});
+}
+
+intensity10 = intensity10
+  .reproject({crs: targetCRS, scale: targetScale})
+  .rename('intensity');
+
+// Exposed: intensity ≥ 0.10
+var exposed = intensity10.gte(INTENSITY_THRESH).rename('exposed');
+
+// Comparison: ~zero intensity, stable non-forest pre, outside buffer
+var zeroIntensity = intensity10.lte(1e-6);
+var exposedBuffer = exposed
+  .reproject({crs: targetCRS, scale: targetScale})
+  .focal_max({radius: BUFFER_METERS, units: 'meters'});
+
+var stableNonForestPre_tgt = stableNonForestPre
+  .setDefaultProjection('EPSG:4326', null, DW_SCALE)
+  .reduceResolution({reducer: ee.Reducer.mode(), maxPixels: 65536})
+  .reproject({crs: targetCRS, scale: targetScale});
+
+var comparison = zeroIntensity
+  .and(stableNonForestPre_tgt)
+  .and(exposedBuffer.not())
+  .rename('comparison');
+
+var treated = exposed.unmask(0).toInt().rename('treated');
+var control = comparison.unmask(0).toInt().rename('control');
+var intensityBand = intensity10.rename('intensity');
+
+Map.addLayer(treated.selfMask(), {palette: ['00FF00']}, 'Exposed (intensity≥0.10)');
+Map.addLayer(control.selfMask(), {palette: ['FFFF00']}, 'Comparison (zero intensity)');
+
+// ===============================
+// 5. FAO-56 PET FROM ERA5-LAND (MONTHLY → ANNUAL)
+// ===============================
+function monthlyPET_FAO56(image) {
+  var t2m = image.select('temperature_2m').subtract(273.15);
+  var td  = image.select('dewpoint_temperature_2m').subtract(273.15);
+  var sp  = image.select('surface_pressure').divide(1000); // kPa
+  var u10 = image.select('u_component_of_wind_10m');
+  var v10 = image.select('v_component_of_wind_10m');
+  var u10s = u10.pow(2).add(v10.pow(2)).sqrt();
+  var u2 = u10s.multiply(4.87).divide(ee.Image.constant(Math.log(67.8 * 10 - 5.42)));
+
+  var ssr = image.select('surface_net_solar_radiation_sum').divide(1e6); // MJ/m2
+  var str = image.select('surface_net_thermal_radiation_sum').divide(1e6);
+  var Rn = ssr.add(str);
+  var G = ee.Image.constant(0);
+
+  var es = t2m.multiply(17.27).divide(t2m.add(237.3)).exp().multiply(0.6108);
+  var ea = td.multiply(17.27).divide(td.add(237.3)).exp().multiply(0.6108);
+  var delta = t2m.multiply(17.27).divide(t2m.add(237.3)).pow(2)
+    .multiply(4098).multiply(es).divide(t2m.add(237.3).pow(2));
+  var gamma = sp.multiply(0.000665);
+
+  var num = delta.multiply(Rn.subtract(G)).multiply(0.408)
+    .add(gamma.multiply(900).multiply(u2).multiply(es.subtract(ea))
+      .divide(t2m.add(273)));
+  var den = delta.add(gamma.multiply(u2.multiply(0.34).add(1)));
+  return num.divide(den).max(0).rename('PET')
+    .copyProperties(image, ['system:time_start']);
+}
+
+var era5Monthly = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR')
+  .filterBounds(roi);
+
+function annualPET(year) {
+  year = ee.Number(year);
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+  return era5Monthly.filterDate(start, end)
+    .map(monthlyPET_FAO56)
+    .sum()
+    .rename('PET')
+    .set('year', year);
+}
+
+// ===============================
+// 6. MODIS OUTCOMES + QA
+// ===============================
+function annualNDVI(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+  return ee.ImageCollection('MODIS/061/MOD13Q1')
+    .filterDate(start, end)
+    .map(function(img) {
+      return img.select('NDVI')
+        .updateMask(img.select('SummaryQA').eq(0))
+        .multiply(0.0001);
+    })
+    .mean().rename('NDVI').set('year', year);
+}
+
+function annualET(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+  return ee.ImageCollection('MODIS/061/MOD16A2GF')
+    .filterDate(start, end)
+    .map(function(img) {
+      var et = img.select('ET').multiply(0.1);
+      return et.updateMask(et.gt(0));
+    })
+    .sum().rename('ET').set('year', year);
+}
+
+function annualLST(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+  return ee.ImageCollection('MODIS/061/MOD11A2')
+    .filterDate(start, end)
+    .map(function(img) {
+      var lst = img.select('LST_Day_1km').multiply(0.02).subtract(273.15);
+      var ok = img.select('QC_Day').bitwiseAnd(3).eq(0);
+      return lst.updateMask(ok);
+    })
+    .mean().rename('LST').set('year', year);
+}
+
+function annualAlbedo(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+  return ee.ImageCollection('MODIS/061/MCD43A3')
+    .filterDate(start, end)
+    .map(function(img) {
+      var alb = img.select('Albedo_WSA_shortwave').multiply(0.001);
+      var qa = img.select('BRDF_Albedo_Band_Mandatory_Quality_shortwave');
+      return alb.updateMask(qa.eq(0));
+    })
+    .mean().rename('albedo').set('year', year);
+}
+
+function annualP(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+  return chirps.filterDate(start, end).sum().rename('P_mm').set('year', year);
+}
+
+// SMAP: no zero fill — empty years stay masked
+function annualSMAP(year) {
+  year = ee.Number(year);
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+  var col = ee.ImageCollection('NASA/SMAP/SPL4SMGP/007')
+    .filterDate(start, end)
+    .select('sm_rootzone');
+  return ee.Image(ee.Algorithms.If(
+    col.size().gt(0),
+    col.mean().multiply(100).rename('rootzone_sm'),
+    ee.Image.constant(0).rename('rootzone_sm').updateMask(ee.Image.constant(0))
+  )).set('year', year);
+}
+
+// ===============================
+// 7. PIXEL ID (px / py)
+// ===============================
+var lonLat = ee.Image.pixelLonLat()
+  .reproject({crs: targetCRS, scale: targetScale});
+
+var px = lonLat.select('longitude').multiply(1e5).toInt().rename('px');
+var py = lonLat.select('latitude').multiply(1e5).toInt().rename('py');
+var pixelId = px.multiply(1e6).add(py).rename('pixel_id');
+
+// ===============================
+// 8. CLUSTERS
+// ===============================
+// ERA5-Land–style ~0.1° cell id (manuscript climate cluster)
+var climate_cluster = lonLat.select('longitude').divide(0.1).floor()
+  .multiply(10000)
+  .add(lonLat.select('latitude').divide(0.1).floor())
+  .toInt()
+  .rename('climate_cluster');
+
+var basins7 = ee.FeatureCollection('WWF/HydroSHEDS/v1/Basins/hybas_7')
+  .filterBounds(roi);
+var basin_l7 = basins7.reduceToImage({
+  properties: ['HYBAS_ID'],
+  reducer: ee.Reducer.first()
+}).rename('basin_l7')
+  .reproject({crs: targetCRS, scale: targetScale})
+  .unmask(0);
+
+// ===============================
+// 9. FIXED SAMPLE MASK (TRUE PANEL)
+// ===============================
+var sampleMask = treated.eq(1).or(control.eq(1));
+
+// ===============================
+// 10. ANNUAL PANEL
+// ===============================
+var years = ee.List.sequence(START_YEAR, END_YEAR);
+
+var panelCollection = ee.ImageCollection.fromImages(
+  years.map(function(y) {
+    y = ee.Number(y);
+    var ndvi = annualNDVI(y);
+    var et   = annualET(y);
+    var pet  = annualPET(y);
+    var lst  = annualLST(y);
+    var alb  = annualAlbedo(y);
+    var P    = annualP(y);
+    var sm   = annualSMAP(y);
+
+    var post = ee.Image.constant(y.gte(2019)).toInt().rename('post');
+    var eventTime = ee.Image.constant(y.subtract(2019)).toInt().rename('event_time');
+
+    return ee.Image.cat([
+      ndvi, et, pet, lst, alb, P, sm,
+      treated, control, intensityBand,
+      post, eventTime,
+      pixelId, px, py,
+      elevation, slope,
+      climate_cluster, basin_l7
+    ])
+    .updateMask(sampleMask)
+    .reproject({crs: targetCRS, scale: targetScale})
+    .clip(roi)
+    .set('year', y)
+    .set('system:time_start', ee.Date.fromYMD(y, 1, 1).millis());
+  })
+);
+
+print('Panel years:', panelCollection.size());
+print('First panel image bands:', panelCollection.first().bandNames());
+
+// ===============================
+// ===============================
+// 11. DIAGNOSTICS — no full-image reproject
+// ===============================
+print('Exposed pixels (sum):', treated.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  crs: targetCRS,
+  scale: targetScale,
+  maxPixels: 1e13,
+  tileScale: 4
+}));
+
+print('Comparison pixels (sum):', control.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  crs: targetCRS,
+  scale: targetScale,
+  maxPixels: 1e13,
+  tileScale: 4
+}));
+
+print('Mean intensity (exposed):', intensityBand.updateMask(treated).reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: roi,
+  crs: targetCRS,
+  scale: targetScale,
+  maxPixels: 1e13,
+  tileScale: 4
+}));
+// ===============================
+// 12. EXPORT TILES + ANNUAL PANEL
+// ===============================
+var b = ee.List(roi.bounds().coordinates().get(0));
+var xmin = ee.Number(ee.List(b.get(0)).get(0));
+var ymin = ee.Number(ee.List(b.get(0)).get(1));
+var xmax = ee.Number(ee.List(b.get(2)).get(0));
+var ymax = ee.Number(ee.List(b.get(2)).get(1));
+
+var lonSeq = ee.List.sequence(xmin, xmax, TILE_DEG);
+var latSeq = ee.List.sequence(ymin, ymax, TILE_DEG);
+
+var tileFC = ee.FeatureCollection(
+  lonSeq.map(function(lon0) {
+    lon0 = ee.Number(lon0);
+    return latSeq.map(function(lat0) {
+      lat0 = ee.Number(lat0);
+      var rect = ee.Geometry.Rectangle(
+        [lon0, lat0, lon0.add(TILE_DEG), lat0.add(TILE_DEG)],
+        'EPSG:4326', false
+      );
+      var inter = rect.intersection(roi, 1);
+      return ee.Algorithms.If(
+        inter.area(1).gt(0),
+        ee.Feature(inter, {
+          tile_id: lon0.format('%.3f').cat('_').cat(lat0.format('%.3f'))
+        }),
+        null
+      );
+    });
+  }).flatten()
+).filter(ee.Filter.notNull(['tile_id']));
+
+print('Export tiles:', tileFC.size());
+
+// Full panel export (fixed mask; may be large — use tileScale / split years if needed)
+var panelSamples = panelCollection.map(function(img) {
+  var y = img.get('year');
+  return img.sample({
+    region: roi,
+    scale: targetScale,
+    tileScale: 8,
+    geometries: false
+  }).map(function(f) {
+    return f.set('year', y).set('outcome_grid', OUTCOME_GRID);
+  });
+}).flatten();
+
+Export.table.toDrive({
+  collection: panelSamples,
+  description: 'DiD_Panel_' + OUTCOME_GRID + '_FIXED',
+  fileFormat: 'CSV',
+  folder: 'Afforestation_Analysis'
+});
+
+// ===============================
+// 13. BUDYKO — HydroSHEDS L12, ≥90% IN BMER
+// ===============================
+var basins12 = ee.FeatureCollection('WWF/HydroSHEDS/v1/Basins/hybas_12')
+  .filterBounds(roi);
+
+var basins12_in = basins12.map(function(f) {
+  var g = f.geometry();
+  var area = g.area(1);
+  var inter = g.intersection(roi, 1).area(1);
+  var frac = inter.divide(area);
+  return f.set({area_m2: area, frac_in_bmer: frac});
+}).filter(ee.Filter.gte('frac_in_bmer', 0.90));
+
+print('Basins L12 with ≥90% in BMER:', basins12_in.size());
+
+var budykoAnnual = panelCollection.map(function(img) {
+  var y = img.get('year');
+  return img.select(['ET', 'PET', 'P_mm', 'intensity', 'treated'])
+    .reduceRegions({
+      collection: basins12_in,
+      reducer: ee.Reducer.mean(),
+      scale: targetScale,
+      tileScale: 4
+    }).map(function(f) {
+      return f.set('year', y);
+      // Compute ET - P in R
+    });
+}).flatten();
+
+Export.table.toDrive({
+  collection: budykoAnnual,
+  description: 'Budyko_Basin_L12_Annual',
+  fileFormat: 'CSV',
+  folder: 'Afforestation_Analysis'
+});
+
+// ===============================
+// 14. SEASONAL DATA
+// ===============================
+function filterMonths(col, year, months) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+  return col.filterDate(start, end).map(function(img) {
+    var m = ee.Date(img.get('system:time_start')).get('month');
+    return img.set('month', m);
+  }).filter(ee.Filter.inList('month', months));
+}
+
+var wetMonths = [6, 7, 8, 9];
+var dryMonths = [10, 11, 12, 1, 2, 3, 4, 5];
+
+function seasonalComposite(year, season) {
+  year = ee.Number(year);
+  season = ee.String(season);
+  var months = ee.List(ee.Algorithms.If(season.equals('wet'), wetMonths, dryMonths));
+
+  var ndvi = filterMonths(ee.ImageCollection('MODIS/061/MOD13Q1'), year, months)
+    .map(function(img) {
+      return img.select('NDVI')
+        .updateMask(img.select('SummaryQA').eq(0))
+        .multiply(0.0001);
+    }).mean().rename('NDVI');
+
+  var et = filterMonths(ee.ImageCollection('MODIS/061/MOD16A2GF'), year, months)
+    .map(function(img) {
+      var e = img.select('ET').multiply(0.1);
+      return e.updateMask(e.gt(0));
+    }).sum().rename('ET');
+
+  var petCol = era5Monthly
+    .filterDate(ee.Date.fromYMD(year, 1, 1), ee.Date.fromYMD(year, 1, 1).advance(1, 'year'))
+    .map(function(img) {
+      var m = ee.Date(img.get('system:time_start')).get('month');
+      return monthlyPET_FAO56(img).set('month', m);
+    })
+    .filter(ee.Filter.inList('month', months));
+  var pet = petCol.sum().rename('PET');
+
+  var lst = filterMonths(ee.ImageCollection('MODIS/061/MOD11A2'), year, months)
+    .map(function(img) {
+      var qa = img.select('QC_Day').bitwiseAnd(3);
+      return img.select('LST_Day_1km').multiply(0.02).subtract(273.15)
+        .updateMask(qa.eq(0));
+    }).mean().rename('LST');
+
+  var P = filterMonths(chirps, year, months).sum().rename('P_mm');
+
+  var post = ee.Image.constant(year.gte(2019)).toInt().rename('post');
+  var eventTime = ee.Image.constant(year.subtract(2019)).toInt().rename('event_time');
+
+  return ee.Image.cat([
+    ndvi, et, pet, lst, P,
+    treated, control, intensityBand,
+    post, eventTime, pixelId, px, py,
+    elevation, slope, climate_cluster, basin_l7
+  ])
+  .updateMask(sampleMask)
+  .reproject({crs: targetCRS, scale: targetScale})
+  .clip(roi)
+  .set({year: year, season: season});
+}
+
+var seasonalList = years.map(function(y) {
+  return [seasonalComposite(y, 'wet'), seasonalComposite(y, 'dry')];
+}).flatten();
+var seasonalCollection = ee.ImageCollection.fromImages(seasonalList);
+
+var seasonalSamples = seasonalCollection.map(function(img) {
+  var y = img.get('year');
+  var s = img.get('season');
+  return img.sample({
+    region: roi,
+    scale: targetScale,
+    tileScale: 8,
+    geometries: false
+  }).map(function(f) {
+    return f.set({year: y, season: s, outcome_grid: OUTCOME_GRID});
+  });
+}).flatten();
+
+Export.table.toDrive({
+  collection: seasonalSamples,
+  description: 'DiD_Seasonal_Panel_' + OUTCOME_GRID,
+  fileFormat: 'CSV',
+  folder: 'Afforestation_Analysis'
+});
+
+print('Script ready.');
+print('PET = FAO-56 ERA5-Land; intensity uses setDefaultProjection before reduceResolution.');
+print('Fixed panel: treated OR control; px/py; climate_cluster + basin_l7.');
+print('Budyko L12 ≥90% BMER; ET−P in R; no CWD; no SMAP zeros.');
