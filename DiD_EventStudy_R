@@ -1,0 +1,2317 @@
+# ===============================
+# 0. LIBRARIES
+# ===============================
+library(data.table)
+library(dplyr)
+library(fixest)
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+library(boot)
+library(readr)
+# ===============================
+setwd("G:/My Drive/R_Results")
+theme_pub <- theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    plot.subtitle = element_text(hjust = 0,face = "bold", size = 13, color = "gray30"),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.title.x = element_text(margin = margin(t = 12),face = "bold"),
+    axis.title.y = element_text(margin = margin(r = 11), face = "bold"),
+    axis.text = element_text(color = "black", size = 12, face = "bold"),
+    panel.grid.major = element_line(color = "gray90", linetype = "dotted"),
+    plot.caption = element_text(size = 9, color = "gray40", hjust = 0),
+    axis.line = element_line(color = "black", linewidth = 1),
+    plot.margin = margin(15, 20, 15, 20),
+    legend.position = "top",
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text = element_text(size = 12),
+    legend.box.margin = margin(t = -10),
+    legend.key.size = unit(0.8, "cm")
+  )
+theme_std <- theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 11, hjust = 0),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "black"),
+    axis.line = element_line(linewidth = 0.5),
+    plot.margin = margin(6, 8, 6, 6)
+  )
+
+# ===============================
+# 1. LOAD DATA
+# ===============================
+df <- fread("D:/Ecohydrology/DiD_EventStudy_Panel_FINAL (done).csv")
+
+# ============================================================
+# Check structure immediately
+cat("=== Data Structure Check ===\n")
+cat("Dimensions:", nrow(df), "rows x", ncol(df), "cols\n")
+cat("Columns:", paste(names(df), collapse = ", "), "\n")
+cat("Years:", sort(unique(df$year)), "\n")
+cat("Treated pixels:", sum(df$treated == 1 & !duplicated(df$pixel_id[df$treated==1])), "\n")
+cat("Control pixels:", sum(df$treated == 0 & !duplicated(df$pixel_id[df$treated==0])), "\n")
+
+# ------------------------------------------------------------
+# Verify rename worked
+cat("\nCleaned columns:", paste(names(df), collapse = ", "), "\n")
+
+# ------------------------------------------------------------
+# 2. CONSTRUCT CLIMATE GRID ID
+# (~9km grid — required for correct clustering)
+# Requires longitude and latitude columns
+# ------------------------------------------------------------
+# Option A: If lat/lon columns exist
+if(all(c("longitude", "latitude") %in% names(df))) {
+  
+  GRID_SIZE_DEG <- 0.0833  # ~9km in degrees (~1/12 degree)
+  
+  df <- df %>%
+    mutate(
+      grid_lon = floor(longitude / GRID_SIZE_DEG) * GRID_SIZE_DEG,
+      grid_lat = floor(latitude  / GRID_SIZE_DEG) * GRID_SIZE_DEG,
+      climate_grid_id = paste0(
+        round(grid_lat, 4), "_",
+        round(grid_lon, 4)
+      )
+    )
+  
+  n_clusters <- length(unique(df$climate_grid_id))
+  cat("\nClimate grid clusters constructed:", n_clusters, "\n")
+  
+  if(n_clusters < 50) {
+    cat("WARNING:", n_clusters, 
+        "clusters — below threshold of 50\n")
+    cat("Wild cluster bootstrap will be applied\n")
+  }
+  
+  # Option B: If no lat/lon — approximate from pixel_id grouping  
+} else {
+  
+  cat("WARNING: No lat/lon columns found\n")
+  cat("Constructing approximate grid from pixel_id ordering\n")
+  cat("RECOMMENDED: Export lat/lon from GEE and re-run\n")
+  
+  # Temporary approximation — assign pixels to groups of ~100
+  # Replace with proper spatial grid when lat/lon available
+  pixel_lookup <- df %>%
+    distinct(pixel_id) %>%
+    arrange(pixel_id) %>%
+    mutate(
+      climate_grid_id = paste0(
+        "grid_",
+        ceiling(row_number() / 100)
+      )
+    )
+  
+  df <- df %>%
+    left_join(pixel_lookup, by = "pixel_id")
+  
+  n_clusters <- length(unique(df$climate_grid_id))
+  cat("Approximate clusters:", n_clusters, "\n")
+  cat("REPLACE WITH PROPER SPATIAL GRID\n")
+}
+
+# ------------------------------------------------------------
+# 3. COMPUTE ANOMALIES
+# Deviation from pre-treatment pixel baseline (2015-2018)
+# ------------------------------------------------------------
+df <- df %>%
+  group_by(pixel_id) %>%
+  mutate(
+    # Pre-treatment means per pixel
+    lst_pre  = mean(LST[year  < 2019], na.rm = TRUE),
+    ndvi_pre = mean(NDVI[year < 2019], na.rm = TRUE),
+    et_pre   = mean(ET[year   < 2019], na.rm = TRUE),
+    
+    # Anomalies = deviation from pre-treatment baseline
+    LST_anom  = LST  - lst_pre,
+    NDVI_anom = NDVI - ndvi_pre,
+    ET_anom   = ET   - et_pre
+  ) %>%
+  ungroup()
+
+# Verify anomalies — pre-treatment mean should be ~0
+cat("\n=== Anomaly Verification ===\n")
+cat("Pre-treatment LST_anom mean (should ≈ 0):",
+    round(mean(df$LST_anom[df$year < 2019], na.rm = TRUE), 4), "\n")
+cat("Pre-treatment NDVI_anom mean (should ≈ 0):",
+    round(mean(df$NDVI_anom[df$year < 2019], na.rm = TRUE), 4), "\n")
+cat("Pre-treatment ET_anom mean (should ≈ 0):",
+    round(mean(df$ET_anom[df$year < 2019], na.rm = TRUE), 4), "\n")
+
+# ------------------------------------------------------------
+# 4. RECONSTRUCT STAGGERED TREATMENT TIMING
+# TRUE FIRST YEAR OF SUSTAINED AFFORESTATION
+# ------------------------------------------------------------
+
+cat("\n=== Constructing Staggered Treatment Cohorts ===\n")
+
+# ------------------------------------------------------------
+# FIRST TREATMENT YEAR PER PIXEL
+# ------------------------------------------------------------
+
+# Identify first post-2018 year where pixel becomes treated
+treat_lookup <- df %>%
+  filter(treated == 1 & post == 1) %>%
+  group_by(pixel_id) %>%
+  summarise(
+    treat_year = min(year, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Merge back to full panel
+df <- df %>%
+  left_join(treat_lookup, by = "pixel_id")
+
+# Never-treated pixels = 0
+df <- df %>%
+  mutate(
+    treat_year = ifelse(is.na(treat_year), 0, treat_year),
+    treat_year = as.integer(treat_year)
+  )
+
+# ------------------------------------------------------------
+# REBUILD EVENT TIME
+# ------------------------------------------------------------
+
+df <- df %>%
+  mutate(
+    event_time = ifelse(
+      treat_year > 0,
+      year - treat_year,
+      NA
+    )
+  )
+
+# ------------------------------------------------------------
+# POST VARIABLE
+# ------------------------------------------------------------
+
+df <- df %>%
+  mutate(
+    post = ifelse(
+      treat_year > 0 & year >= treat_year,
+      1,
+      0
+    ),
+    
+    treat_post = treated * post
+  )
+
+# ------------------------------------------------------------
+# KEEP EVENT WINDOW
+# ------------------------------------------------------------
+
+df <- df %>%
+  filter(
+    is.na(event_time) |
+      (event_time >= -4 & event_time <= 6)
+  )
+
+# ------------------------------------------------------------
+# DIAGNOSTICS
+# ------------------------------------------------------------
+
+cat("\nTreatment cohorts:\n")
+print(table(df$treat_year))
+
+cat("\nUnique treatment years:\n")
+print(sort(unique(df$treat_year)))
+# 5. CONSTRUCT TREATMENT VARIABLES
+# ------------------------------------------------------------
+df <- df %>%
+  filter(event_time >= -4 & event_time <= 6) %>%  
+  mutate(
+    
+     # Verify event_time is correct
+    event_time_check = year - 2019,
+    
+    # Explicit treat_post interaction for TWFE
+    treat_post = treated * post,
+    
+    # Relevel event_time factor with k=-1 as reference
+    k_factor = relevel(
+      factor(event_time,
+             levels = sort(unique(event_time))),
+      ref = "-1"
+    )
+  )
+
+# Verify event_time
+cat("\n=== Event Time Verification ===\n")
+cat("event_time range:", 
+    min(df$event_time), "to", max(df$event_time), "\n")
+cat("Expected: -4 to +6\n")
+
+# Check consistency with year
+mismatch <- sum(df$event_time != df$event_time_check, na.rm = TRUE)
+cat("event_time mismatches with year-2019:", mismatch, "\n")
+
+# ------------------------------------------------------------
+# 6. DATA QUALITY CHECKS
+# ------------------------------------------------------------
+cat("\n=== Missing Values ===\n")
+vars_check <- c("LST_anom", "NDVI_anom", "ET_anom",
+                "P_mm", "rootzone_sm", "albedo",
+                "treated", "post", "event_time",
+                "pixel_id", "year", "climate_grid_id")
+
+for(v in vars_check) {
+  n_miss <- sum(is.na(df[[v]]))
+  if(n_miss > 0) cat(v, ":", n_miss, "missing values\n")
+}
+
+cat("\n=== Balance Check ===\n")
+balance <- df %>%
+  filter(year < 2019) %>%
+  group_by(treated) %>%
+  summarise(
+    n_pixels    = n_distinct(pixel_id),
+    mean_NDVI   = round(mean(NDVI,  na.rm = TRUE), 4),
+    mean_LST    = round(mean(LST,   na.rm = TRUE), 4),
+    mean_ET     = round(mean(ET,    na.rm = TRUE), 4),
+    mean_P      = round(mean(P_mm,  na.rm = TRUE), 4),
+    mean_SM     = round(mean(rootzone_sm, na.rm = TRUE), 4),
+    .groups = "drop"
+  )
+print(balance)
+
+# ------------------------------------------------------------
+# 7. EVENT-STUDY MODELS (Eq. 02)
+# Consistent climate covariates across all outcomes
+CLIMATE_COVARS <- "P_mm + rootzone_sm"
+
+cat("\n=== Running Event-Study Models ===\n")
+
+es_lst <- feols(
+  as.formula(paste0(
+    "LST_anom ~ i(event_time, treated, ref = -1) + ",
+    CLIMATE_COVARS,
+    " | pixel_id + year"
+  )),
+  data    = df,
+  cluster = ~climate_grid_id
+)
+
+es_ndvi <- feols(
+  as.formula(paste0(
+    "NDVI_anom ~ i(event_time, treated, ref = -1) + ",
+    CLIMATE_COVARS,
+    " | pixel_id + year"
+  )),
+  data    = df,
+  cluster = ~climate_grid_id
+)
+
+es_et <- feols(
+  as.formula(paste0(
+    "ET_anom ~ i(event_time, treated, ref = -1) + ",
+    CLIMATE_COVARS,
+    " | pixel_id + year"
+  )),
+  data    = df,
+  cluster = ~climate_grid_id
+)
+
+cat("Event-study models complete\n")
+
+# ------------------------------------------------------------
+# 8. TWFE DiD MODELS (Eq. 01)
+# ------------------------------------------------------------
+cat("\n=== Running TWFE DiD Models ===\n")
+
+did_lst <- feols(
+  as.formula(paste0(
+    "LST_anom ~ treat_post + ",
+    CLIMATE_COVARS,
+    " | pixel_id + year"
+  )),
+  data    = df,
+  cluster = ~climate_grid_id
+)
+
+did_ndvi <- feols(
+  as.formula(paste0(
+    "NDVI_anom ~ treat_post + ",
+    CLIMATE_COVARS,
+    " | pixel_id + year"
+  )),
+  data    = df,
+  cluster = ~climate_grid_id
+)
+
+did_et <- feols(
+  as.formula(paste0(
+    "ET_anom ~ treat_post + ",
+    CLIMATE_COVARS,
+    " | pixel_id + year"
+  )),
+  data    = df,
+  cluster = ~climate_grid_id
+)
+
+cat("\n=== TWFE Results ===\n")
+etable(did_lst, did_ndvi, did_et,
+       headers  = c("LST", "NDVI", "ET"),
+       keep     = "treat_post",
+       se.below = TRUE)
+
+# ------------------------------------------------------------
+# 9. PARALLEL TRENDS TEST
+# Joint F-test on pre-treatment coefficients k=-4,-3,-2
+# ------------------------------------------------------------
+cat("\n=== Parallel Trends Tests ===\n")
+
+test_pt <- function(model, outcome) {
+  
+  coef_names <- names(coef(model))
+  pre_terms  <- grep(
+    "event_time::-[432]",
+    coef_names,
+    value = TRUE
+  )
+  
+  if(length(pre_terms) == 0) {
+    cat(outcome, ": No pre-treatment terms found\n")
+    return(NULL)
+  }
+  
+  jt <- wald(model, keep = pre_terms)
+  
+  cat(outcome, "- Joint F-test on k=-4,-3,-2:\n")
+  cat("  F =", round(jt$stat, 3),
+      "| p =", round(jt$p, 4))
+  cat(ifelse(jt$p > 0.05,
+             " ✅ PASS\n",
+             " ❌ FAIL\n"))
+  return(jt)
+}
+
+pt_lst  <- test_pt(es_lst,  "LST")
+pt_ndvi <- test_pt(es_ndvi, "NDVI")
+pt_et   <- test_pt(es_et,   "ET")
+
+# ------------------------------------------------------------
+
+# Install from the package developer's R-universe repository
+install.packages(
+  "fwildclusterboot",
+  repos = c(
+    "https://s3alfisc.r-universe.dev",
+    "https://cloud.r-project.org"
+  )
+)
+
+# Load package
+library(fwildclusterboot)
+
+# 10. WILD CLUSTER BOOTSTRAP
+# Required when clusters < 50
+# ------------------------------------------------------------
+cat("\n=== Wild Cluster Bootstrap ===\n")
+
+run_wcb <- function(model, outcome, B = 999) {
+  cat(outcome, "- Wild cluster bootstrap (B =", B, "):\n")
+  
+  tryCatch({
+    wb <- boottest(
+      model,
+      clustid     = "climate_grid_id",
+      param       = "treat_post",
+      B           = B,
+      type        = "rademacher",
+      impose_null = TRUE
+    )
+    cat("  p-value:", round(wb$p_val, 4), "\n")
+    cat("  95% CI: [",
+        round(wb$conf_int[1], 4), ",",
+        round(wb$conf_int[2], 4), "]\n")
+    return(wb)
+  }, error = function(e) {
+    cat("  Bootstrap failed:", e$message, "\n")
+    return(NULL)
+  })
+}
+
+wb_lst  <- run_wcb(did_lst,  "LST")
+wb_ndvi <- run_wcb(did_ndvi, "NDVI")
+wb_et   <- run_wcb(did_et,   "ET")
+# =====================================================
+
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+# 11. EXTRACT COEFFICIENTS k = -4 … +6  →  TABLE
+# ------------------------------------------------------------
+extract_coefs <- function(model, outcome) {
+  cf <- coef(model)
+  se <- se(model)
+  idx <- grep("event_time::", names(cf))
+  
+  k_vals <- as.numeric(gsub(".*event_time::(-?\\d+).*", "\\1", names(cf)[idx]))
+  
+  out <- data.frame(
+    outcome  = outcome,
+    k        = k_vals,
+    theta    = unname(cf[idx]),
+    se       = unname(se[idx]),
+    ci_lower = unname(cf[idx] - 1.96 * se[idx]),
+    ci_upper = unname(cf[idx] + 1.96 * se[idx]),
+    stringsAsFactors = FALSE
+  )
+  
+  # Reference period k = -1 (normalized to 0)
+  ref <- data.frame(
+    outcome = outcome, k = -1,
+    theta = 0, se = 0, ci_lower = 0, ci_upper = 0
+  )
+  
+  dplyr::bind_rows(out, ref) %>%
+    dplyr::arrange(k)
+}
+
+es_coefs <- dplyr::bind_rows(
+  extract_coefs(es_lst,  "LST"),
+  extract_coefs(es_ndvi, "NDVI"),
+  extract_coefs(es_et,   "ET")
+)
+
+# Ensure full grid -4:6 even if a lead/lag is missing in data
+full_grid <- expand.grid(
+  outcome = c("LST", "NDVI", "ET"),
+  k = -4:6,
+  stringsAsFactors = FALSE
+)
+
+es_coefs_full <- full_grid %>%
+  left_join(es_coefs, by = c("outcome", "k")) %>%
+  mutate(
+    theta    = ifelse(k == -1 & is.na(theta), 0, theta),
+    se       = ifelse(k == -1 & is.na(se), 0, se),
+    ci_lower = ifelse(k == -1 & is.na(ci_lower), 0, ci_lower),
+    ci_upper = ifelse(k == -1 & is.na(ci_upper), 0, ci_upper)
+  ) %>%
+  arrange(outcome, k)
+
+# ---- Wide coefficient table (one row per k) ----
+coef_table_wide <- es_coefs_full %>%
+  mutate(
+    cell = sprintf("%.4f (%.4f)", theta, se)
+  ) %>%
+  select(outcome, k, cell) %>%
+  tidyr::pivot_wider(names_from = outcome, values_from = cell) %>%
+  arrange(k)
+
+# ---- Long table with CI (for SI / plotting) ----
+coef_table_long <- es_coefs_full %>%
+  mutate(
+    theta    = round(theta, 4),
+    se       = round(se, 4),
+    ci_lower = round(ci_lower, 4),
+    ci_upper = round(ci_upper, 4),
+    significant_95 = ifelse(k == -1, "ref",
+                            ifelse(ci_lower > 0 | ci_upper < 0, "yes", "no"))
+  )
+
+cat("\n=== Event-study coefficients (k = -4 to +6, ref = -1) ===\n")
+print(coef_table_wide)
+print(coef_table_long)
+
+write.csv(coef_table_wide,  "Table_EventStudy_Coefs_Wide_k-4_to_6.csv",  row.names = FALSE)
+write.csv(coef_table_long,  "Table_EventStudy_Coefs_Long_k-4_to_6.csv",  row.names = FALSE)
+write.csv(es_coefs_full,    "Table_EventStudy_Coefs_Full_k-4_to_6.csv", row.names = FALSE)
+
+# ------------------------------------------------------------
+# 12. PLACEBO PERMUTATION TEST (n = 500)
+# ------------------------------------------------------------
+cat("\n=== Placebo Permutation Tests ===\n")
+
+run_placebo <- function(outcome, data, n_perm = 500) {
+  set.seed(2024)
+  
+  obs_model <- feols(
+    as.formula(paste0(
+      outcome, "_anom ~ treat_post + ",
+      CLIMATE_COVARS,
+      " | pixel_id + year"
+    )),
+    data    = data,
+    cluster = ~climate_grid_id
+  )
+  
+  obs_att <- coef(obs_model)[["treat_post"]]
+  
+  if(is.na(obs_att)) {
+    stop(paste("ATT not found for", outcome))
+  }
+  
+  cat(outcome, "- Running", n_perm, "permutations...\n")
+  
+  perm_atts <- numeric(n_perm)
+  
+  for(i in seq_len(n_perm)) {
+    
+    perm_pixels <- data %>%
+      distinct(pixel_id, treated) %>%
+      mutate(treated_perm = sample(treated, size = n(), replace = FALSE))
+    
+    perm_data <- data %>%
+      left_join(
+        perm_pixels %>% select(pixel_id, treated_perm),
+        by = "pixel_id"
+      ) %>%
+      mutate(treat_post = treated_perm * post)
+    
+    perm_model <- feols(
+      as.formula(paste0(
+        outcome, "_anom ~ treat_post + ",
+        CLIMATE_COVARS,
+        " | pixel_id + year"
+      )),
+      data    = perm_data,
+      cluster = ~climate_grid_id
+    )
+    
+    perm_atts[i] <- coef(perm_model)[["treat_post"]]
+  }
+  
+  # ✅ Corrected p-value
+  p_val <- (sum(abs(perm_atts) >= abs(obs_att)) + 1) / (n_perm + 1)
+  
+  cat("  Observed ATT:", round(obs_att, 4), "\n")
+  cat("  Permutation p:", round(p_val, 4), "\n")
+  
+  list(
+    outcome      = outcome,
+    observed_att = obs_att,
+    placebo_dist = perm_atts,
+    p_value      = p_val
+  )
+}
+
+placebo_lst  <- run_placebo("LST",  df)
+placebo_ndvi <- run_placebo("NDVI", df)
+placebo_et   <- run_placebo("ET",   df)
+
+# ------------------------------------------------------------
+# TABLE S8: INFERENCE ROBUSTNESS
+# =====================================================
+
+extract_inference <- function(model, wb_obj, placebo_obj, outcome){
+  
+  att <- coef(model)["treat_post"]
+  
+  se_clust <- se(model)["treat_post"]
+  
+  ct <- coeftable(model)
+  
+  p_clust <- ct["treat_post","Pr(>|t|)"]
+  
+  if(!is.null(wb_obj)){
+    
+    wb_p <- wb_obj$p_val
+    
+    wb_ci_low  <- wb_obj$conf_int[1]
+    wb_ci_high <- wb_obj$conf_int[2]
+    
+  } else {
+    
+    wb_p <- NA
+    wb_ci_low <- NA
+    wb_ci_high <- NA
+  }
+  
+  data.frame(
+    Outcome = outcome,
+    ATT = round(att,4),
+    Clustered_SE = round(se_clust,4),
+    Clustered_p = round(p_clust,4),
+    WildBootstrap_p = round(wb_p,4),
+    WildBootstrap_CI =
+      paste0("[",
+             round(wb_ci_low,4),
+             ", ",
+             round(wb_ci_high,4),
+             "]"),
+    Placebo_p = round(placebo_obj$p_value,4)
+  )
+}
+
+Table_S8 <- bind_rows(
+  
+  extract_inference(
+    did_ndvi,
+    wb_ndvi,
+    placebo_ndvi,
+    "NDVI"
+  ),
+  
+  extract_inference(
+    did_et,
+    wb_et,
+    placebo_et,
+    "ET"
+  ),
+  
+  extract_inference(
+    did_lst,
+    wb_lst,
+    placebo_lst,
+    "LST"
+  )
+)
+
+print(Table_S8)
+write.csv(
+  Table_S8,
+  "Table_S8_Inference_Robustness.csv",
+  row.names = FALSE
+)
+
+# 13. STANDARDIZED EFFECTS FOR FOREST PLOT
+# ------------------------------------------------------------
+standardize <- function(did_model, outcome, data) {
+  
+  pre_sd <- data %>%
+    filter(year < 2019) %>%
+    pull(paste0(outcome, "_anom")) %>%
+    sd(na.rm = TRUE)
+  
+  att    <- coef(did_model)["treat_post"]
+  se_raw <- se(did_model)["treat_post"]
+  
+  data.frame(
+    outcome  = outcome,
+    att_raw  = round(att, 4),
+    att_sd   = round(att / pre_sd, 4),
+    ci_lower = round((att - 1.96 * se_raw) / pre_sd, 4),
+    ci_upper = round((att + 1.96 * se_raw) / pre_sd, 4)
+  )
+}
+
+std_effects <- bind_rows(
+  standardize(did_lst,  "LST",  df),
+  standardize(did_ndvi, "NDVI", df),
+  standardize(did_et,   "ET",   df)
+)
+
+cat("\n=== Standardized Effects ===\n")
+print(std_effects)
+
+# 5. DiD CHECK (ALBEDO MODEL)
+# =========================
+
+m_albedo <- feols(
+  albedo ~ treated * post | pixel_id + year,
+  data = df,
+  cluster = ~pixel_id
+)
+
+summary(m_albedo)
+
+# ------------------------------------------------------------
+# 15. RESULTS SUMMARY
+# ------------------------------------------------------------
+cat("\n=== FINAL RESULTS SUMMARY ===\n")
+
+summary_table <- data.frame(
+  Outcome = c("LST", "NDVI", "ET"),
+  
+  ATT_raw = c(
+    round(coef(did_lst)["treat_post"],  4),
+    round(coef(did_ndvi)["treat_post"], 4),
+    round(coef(did_et)["treat_post"],   4)
+  ),
+  
+  ATT_SD   = std_effects$att_sd,
+  CI_lower = std_effects$ci_lower,
+  CI_upper = std_effects$ci_upper,
+  
+  Pretrend_p = c(
+    round(pt_lst$p,  4),
+    round(pt_ndvi$p, 4),
+    round(pt_et$p,   4)
+  ),
+  
+  Placebo_p = c(
+    round(placebo_lst$p_value,  4),
+    round(placebo_ndvi$p_value, 4),
+    round(placebo_et$p_value,   4)
+  ),
+  
+  N_clusters = n_clusters
+)
+
+print(summary_table)
+
+write.csv(summary_table,
+          "Results_Summary.csv",
+          row.names = FALSE)
+
+cat("\n=== Analysis Complete ===\n")
+cat("Outputs:\n")
+cat("  Figure4_EventStudy.png/.pdf\n")
+cat("  Results_Summary.csv\n")
+
+
+df <- df %>%
+  mutate(
+    pixel_id = as.factor(pixel_id),
+    year = as.integer(year),
+    treated = as.integer(treated),
+    post = as.integer(post),
+    event_time = as.integer(event_time)
+  )
+
+# ===============================
+# 2. BASELINE FILTERING (BALANCED SAMPLE)
+# ===============================
+df <- df %>%
+  group_by(pixel_id) %>%
+  mutate(
+    NDVI_pre = mean(NDVI[year < 2019], na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+q_low  <- quantile(df$NDVI_pre, 0.1, na.rm = TRUE)
+q_high <- quantile(df$NDVI_pre, 0.9, na.rm = TRUE)
+
+df <- df %>%
+  filter(NDVI_pre > q_low & NDVI_pre < q_high)
+
+# ===============================
+# 3. ANOMALIES (CORE IDENTIFICATION)
+# ===============================
+df <- df %>%
+  group_by(pixel_id) %>%
+  mutate(
+    LST_base  = mean(LST[year < 2019], na.rm = TRUE),
+    NDVI_base = mean(NDVI[year < 2019], na.rm = TRUE),
+    ET_base   = mean(ET[year < 2019], na.rm = TRUE),
+    
+    LST_anom  = LST - LST_base,
+    NDVI_anom = NDVI - NDVI_base,
+    ET_anom   = ET - ET_base
+  ) %>%
+  ungroup()
+
+# ===============================
+# 4. EVENT WINDOW
+# ===============================
+df <- df %>%
+  filter(event_time >= -4 & event_time <= 6)
+
+# ===============================
+# 5. EVENT-STUDY MODELS
+# ===============================
+es_lst <- feols(
+  LST_anom ~ i(event_time, treated, ref = -1) +
+    NDVI_anom + albedo + P_mm + rootzone_sm |
+    pixel_id + year,
+  data = df,
+  cluster = ~pixel_id
+)
+
+es_ndvi <- feols(
+  NDVI_anom ~ i(event_time, treated, ref = -1) |
+    pixel_id + year,
+  data = df,
+  cluster = ~pixel_id
+)
+
+es_et <- feols(
+  ET_anom ~ i(event_time, treated, ref = -1) |
+    pixel_id + year,
+  data = df,
+  cluster = ~pixel_id
+)
+
+# ===============================
+# 6. DiD MODEL
+# ===============================
+did_lst <- feols(
+  LST_anom ~ treated * post +
+    NDVI_anom + albedo + P_mm + rootzone_sm |
+    pixel_id + year,
+  data = df,
+  cluster = ~pixel_id
+)
+
+# ===============================
+# 7. EXTRACT EVENT-STUDY RESULTS
+# ===============================
+extract_es <- function(model, varname){
+  broom::tidy(model, conf.int = TRUE) %>%
+    filter(grepl("event_time::", term)) %>%
+    mutate(
+      event_time = as.numeric(gsub(".*::(-?[0-9]+).*", "\\1", term)),
+      variable = varname
+    )
+}
+
+df_es <- bind_rows(
+  extract_es(es_ndvi, "NDVI"),
+  extract_es(es_et, "ET"),
+  extract_es(es_lst, "LST")
+)
+
+df_es$variable <- factor(df_es$variable, levels = c("NDVI","ET","LST"))
+
+# ===============================
+# 8. EVENT-STUDY PLOTS (RSE STYLE)
+# ===============================
+plot_event <- function(data, ylab, title){
+  
+  ggplot(data, aes(event_time, estimate)) +
+    
+    # Reference lines
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+    geom_vline(xintercept = -1, linetype = "dotted", linewidth = 0.4) +
+  
+    
+    # Post-treatment shading
+    annotate("rect", xmin = 0, xmax = 6,
+             ymin = -Inf, ymax = Inf,
+             alpha = 0.05) +
+    
+    # Confidence intervals
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                  width = 0.15, linewidth = 0.8) +
+    
+    # Point estimates
+    geom_point(size = 2) +
+    
+    scale_x_continuous(breaks = seq(-4, 6, 1)) +
+    
+    labs(
+      x = "Years since afforestation (t = 0 = treatment year)",
+      y = ylab,
+      title = title
+    ) +
+    
+    theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.title = element_text(face = "bold"),
+      axis.title = element_text(face = "bold")
+    )+ theme_pub+
+    theme_pub+theme(
+      plot.title = element_text(
+        hjust = 0,
+        face = "bold",
+        size = 16
+      ),
+      plot.title.position = "plot"
+    )
+}
+
+p_ndvi <- plot_event(df_es %>% filter(variable=="NDVI"),
+                     "ΔNDVI", "(a)")
+
+p_et   <- plot_event(df_es %>% filter(variable=="ET"),
+                     "ΔET(mm yr⁻¹)", "(b)")
+
+p_lst  <- plot_event(df_es %>% filter(variable=="LST"),
+                     "ΔLST (°C)", "(c)")
+# Forest plot
+p_forest <- ggplot(
+  std_effects %>%
+    mutate(outcome = factor(outcome,
+                            levels = c("LST","ET","NDVI"))),
+  aes(x = att_sd, y = outcome)
+) +
+  geom_vline(xintercept = 0,
+             linetype = "dashed",
+             color = "grey40") +
+  geom_errorbarh(aes(xmin = ci_lower,
+                     xmax = ci_upper),
+                 height    = 0.15,
+                 linewidth = 0.8) +
+  geom_point(size = 3) +
+  labs(
+    x     = "Standardized treatment effect (SD units)",
+    y     = NULL,
+    title = "(d)"
+  ) +
+  theme_pub+theme(
+    plot.title = element_text(
+      hjust = 0,
+      face = "bold",
+      size = 16
+    ),
+    plot.title.position = "plot"
+  )
+print(p_forest)
+# ===============================
+# 10. FINAL MULTI-PANEL FIGURE
+# ===============================
+final_figure_std <- (p1_ndvi | p2_et) /(p_lst| p_forest)
+
+final_figure_std
+
+# ===============================
+# 11. EXPORT
+# ===============================
+ggsave("DID_Event.png",
+       final_figure_std,
+       width = 12,
+       height = 8,
+       dpi = 600)
+
+# ===============================
+
+
+# ============================================================================
+# sensitivity of the main estimates to the outcome-based
+
+# =====================================================================
+# SENSITIVITY ANALYSIS: PRE-TREATMENT SLOPE FILTERING
+# Full sample ATT, sensitivity grid, Table S10, and random-removal test
+# =====================================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(fixest)
+  library(ggplot2)
+})
+
+# ---------------------------- 0. SETTINGS -------------------------------
+
+panel_file <- "D:/Ecohydrology/DiD_EventStudy_Panel_FINAL (done).csv"
+out_dir    <- "I:/Afforestation_Analysis/results_filter"
+
+outcomes   <- c("NDVI", "ET", "LST", "albedo")
+onset      <- 2019L
+ref_year   <- 2018L
+first_year <- 2015L
+
+main_metric <- "slope_pooled"  # "slope_pooled" or "slope_group"
+main_k      <- 3
+ks          <- c(1.5, 2, 3, 4, 6)
+n_random    <- 100L
+
+set.seed(42)
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+save_tab <- function(x, name) {
+  fwrite(x, file.path(out_dir, paste0(name, ".csv")))
+  invisible(x)
+}
+
+# ---------------------------- 1. LOAD DATA -------------------------------
+
+D <- fread(panel_file)
+
+if (!"albedo" %in% names(D) && "Albedo" %in% names(D)) {
+  setnames(D, "Albedo", "albedo")
+}
+
+outcomes <- outcomes[outcomes %in% names(D)]
+
+if (!length(outcomes)) {
+  stop("None of the requested outcomes were found in the panel file.")
+}
+
+# Select a valid clustering variable.
+# Prefer a supplied spatial cluster/basin identifier. If none exists,
+# fall back to pixel_id because the model includes pixel fixed effects.
+cl_candidates <- intersect(
+  c("climate_cluster", "cluster_id", "cluster", "basin_id"),
+  names(D)
+)
+
+if (length(cl_candidates)) {
+  clvar <- cl_candidates[1]
+  cluster_source <- paste0("provided column: ", clvar)
+} else if ("pixel_id" %in% names(D)) {
+  clvar <- "pixel_id"
+  cluster_source <- "fallback: pixel_id"
+  message(
+    "No climate/basin cluster column found. Using pixel_id for clustered SEs. ",
+    "This is valid only if pixel_id identifies a stable analytical unit."
+  )
+} else {
+  stop(
+    "No usable cluster identifier. Expected climate_cluster, cluster_id, ",
+    "cluster, basin_id, or pixel_id."
+  )
+}
+
+required <- c("year", "treated", "pixel_id", clvar)
+missing_cols <- setdiff(required, names(D))
+
+if (length(missing_cols)) {
+  stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+
+D[, year := as.integer(year)]
+D[, treated := as.integer(treated)]
+
+D <- D[year >= first_year]
+D <- D[treated %in% c(0L, 1L)]
+
+if ("control" %in% names(D)) {
+  D <- D[treated == 1L | as.integer(control) == 1L]
+}
+
+D[, cluster := get(clvar)]
+D[, post := as.integer(year >= onset)]
+D[, event_time := year - onset]
+D[, treat_post := treated * post]
+
+if (D[, anyNA(pixel_id) | anyNA(year) | anyNA(treated) |
+      anyNA(cluster)]) {
+  stop("Missing pixel, year, treatment, or cluster identifiers remain.")
+}
+
+if (D[, uniqueN(treated)] != 2L) {
+  stop("The analysis requires both treated and comparison observations.")
+}
+
+if (D[, uniqueN(cluster)] < 2L) {
+  stop("At least two clusters are required for clustered inference.")
+}
+
+# Validate that treatment is constant for each pixel across years.
+# Do not remove or average inconsistent records automatically: that would
+# change the treatment definition and could bias the analysis.
+treatment_check <- D[, .(
+  n_treatment_values = uniqueN(treated),
+  n_years = uniqueN(year),
+  n_records = .N
+), by = pixel_id]
+
+inconsistent_ids <- treatment_check[n_treatment_values > 1L]
+if (nrow(inconsistent_ids)) {
+  diagnostic_file <- file.path(out_dir, "S10_pixel_treatment_inconsistency.csv")
+  fwrite(inconsistent_ids[order(-n_records)], diagnostic_file)
+  stop(
+    "Treatment is not constant within ", nrow(inconsistent_ids),
+    " pixel_id(s). A diagnostic list was saved to: ", diagnostic_file,
+    " . Resolve the spatial-unit/treatment mapping before estimating the models."
+  )
+}
+
+P <- unique(D[, .(pixel_id, treated)])
+
+cat(sprintf(
+  paste0(
+    "\nPanel: %s rows; %s pixels; ",
+    "%s treated and %s comparison pixels; %s clusters\n"
+  ),
+  format(nrow(D), big.mark = ","),
+  format(nrow(P), big.mark = ","),
+  format(P[treated == 1L, .N], big.mark = ","),
+  format(P[treated == 0L, .N], big.mark = ","),
+  uniqueN(D$cluster)
+))
+
+cat("Outcomes:", paste(outcomes, collapse = ", "), "\n")
+cat("Cluster variable:", clvar, "(", cluster_source, ")\n", sep = "")
+
+# ---------------------------- 2. HELPERS ---------------------------------
+
+# ATT with pixel and year fixed effects.
+# Returns a numeric vector: att, se, lo, hi.
+
+fit_att <- function(y, d) {
+  
+  formula_att <- as.formula(
+    paste0(y, " ~ treat_post | pixel_id + year")
+  )
+  
+  model <- feols(
+    formula_att,
+    data = d,
+    cluster = ~cluster
+  )
+  
+  b <- coef(model)
+  s <- se(model)
+  
+  if (!"treat_post" %in% names(b) ||
+      !"treat_post" %in% names(s)) {
+    stop("ATT coefficient unavailable for outcome: ", y)
+  }
+  
+  ci <- confint(model, parm = "treat_post", level = 0.95)
+  
+  result <- c(
+    att = as.numeric(b[["treat_post"]]),
+    se  = as.numeric(s[["treat_post"]]),
+    lo  = as.numeric(ci[1, 1]),
+    hi  = as.numeric(ci[1, 2])
+  )
+  
+  if (!all(is.finite(result))) {
+    stop("Non-finite ATT result for outcome: ", y)
+  }
+  
+  result
+}
+
+
+# Joint test of pre-treatment event-study coefficients.
+# Returns NA when the test cannot be estimated.
+
+pre_p <- function(y, d) {
+  
+  formula_es <- as.formula(
+    paste0(
+      y,
+      " ~ i(event_time, treated, ref = ",
+      ref_year - onset,
+      ") | pixel_id + year"
+    )
+  )
+  
+  model <- feols(
+    formula_es,
+    data = d,
+    cluster = ~cluster
+  )
+  
+  result <- tryCatch(
+    wald(
+      model,
+      keep = "event_time::-[2-9][0-9]*:treated",
+      print = FALSE
+    ),
+    error = function(e) NULL
+  )
+  
+  # Fallback for the common fixest coefficient naming pattern.
+  if (is.null(result)) {
+    result <- tryCatch(
+      wald(
+        model,
+        keep = "event_time::-[2-9]:treated",
+        print = FALSE
+      ),
+      error = function(e) NULL
+    )
+  }
+  
+  if (is.null(result)) return(NA_real_)
+  
+  p <- result$p
+  
+  if (is.null(p) || !length(p)) return(NA_real_)
+  
+  as.numeric(p[1])
+}
+
+
+# Pre-treatment slope of the treated-minus-comparison mean gap.
+
+pre_gap_slope <- function(y, d) {
+  
+  g <- d[year < onset,
+         .(m = mean(get(y), na.rm = TRUE)),
+         by = .(year, treated)]
+  
+  g <- dcast(g, year ~ treated, value.var = "m")
+  
+  if (!all(c("0", "1") %in% names(g)) || nrow(g) < 2L) {
+    return(NA_real_)
+  }
+  
+  g[, gap := `1` - `0`]
+  
+  as.numeric(coef(lm(gap ~ year, data = g))[["year"]])
+}
+
+
+# Pixel-specific pre-treatment slopes.
+# Treatment status is attached from the unique pixel table.
+
+pixel_slopes <- function(y) {
+  
+  S <- D[
+    year < onset,
+    {
+      x <- get(y)
+      ok <- is.finite(x) & is.finite(year)
+      
+      slope <- if (sum(ok) >= 3L &&
+                   var(year[ok]) > 0) {
+        cov(year[ok], x[ok]) / var(year[ok])
+      } else {
+        NA_real_
+      }
+      
+      .(sl = as.numeric(slope))
+    },
+    by = pixel_id
+  ]
+  
+  S <- merge(
+    S,
+    P,
+    by = "pixel_id",
+    all.x = TRUE,
+    sort = FALSE
+  )
+  
+  S[]
+}
+
+
+# Identify outlying pixel slopes using a median/MAD rule.
+# If MAD is zero or undefined, that group is not filtered.
+
+drop_ids <- function(S, metric, k) {
+  
+  S <- copy(S[is.finite(sl)])
+  
+  if (!nrow(S)) return(S$pixel_id)
+  
+  if (metric == "slope_pooled") {
+    
+    center <- median(S$sl, na.rm = TRUE)
+    spread <- mad(S$sl, center = center, na.rm = TRUE)
+    
+    if (!is.finite(spread) || spread <= 0) {
+      return(S$pixel_id[0])
+    }
+    
+    return(unique(
+      S[abs(sl - center) > k * spread, pixel_id]
+    ))
+  }
+  
+  if (metric == "slope_group") {
+    
+    S[, `:=`(
+      center = median(sl, na.rm = TRUE),
+      spread = mad(sl, na.rm = TRUE)
+    ), by = treated]
+    
+    S[, z := fifelse(
+      is.finite(spread) & spread > 0,
+      abs(sl - center) / spread,
+      NA_real_
+    )]
+    
+    return(unique(S[z > k, pixel_id]))
+  }
+  
+  stop("Unknown filtering metric: ", metric)
+}
+
+
+# Format a full-sample estimate and confidence interval.
+
+fmt_ci <- function(r) {
+  
+  sprintf(
+    "%.3g [%.3g, %.3g]",
+    as.numeric(r[["att"]]),
+    as.numeric(r[["lo"]]),
+    as.numeric(r[["hi"]])
+  )
+}
+
+
+# ---------------------------- 3. FULL-SAMPLE BASELINE --------------------
+
+cat("\n===== Full-sample baseline =====\n")
+
+base <- setNames(
+  lapply(outcomes, function(y) {
+    
+    list(
+      att = fit_att(y, D),
+      p   = pre_p(y, D),
+      gs  = pre_gap_slope(y, D)
+    )
+    
+  }),
+  outcomes
+)
+
+baseline_table <- rbindlist(lapply(outcomes, function(y) {
+  
+  a <- base[[y]]$att
+  
+  data.table(
+    outcome = y,
+    att = as.numeric(a[["att"]]),
+    se = as.numeric(a[["se"]]),
+    lo = as.numeric(a[["lo"]]),
+    hi = as.numeric(a[["hi"]]),
+    pretrend_p = as.numeric(base[[y]]$p),
+    pre_gap_slope = as.numeric(base[[y]]$gs)
+  )
+  
+}))
+
+print(baseline_table, digits = 4)
+save_tab(baseline_table, "S10_full_sample_baseline")
+
+
+# ---------------------------- 4. SENSITIVITY GRID ------------------------
+
+cat("\n===== Sensitivity grid =====\n")
+
+grid_list <- list()
+counter <- 0L
+
+for (y in outcomes) {
+  
+  cat("Processing outcome:", y, "\n")
+  
+  S <- pixel_slopes(y)
+  full_att <- as.numeric(base[[y]]$att[["att"]])
+  
+  for (mt in c("slope_pooled", "slope_group")) {
+    
+    for (k in ks) {
+      
+      ids <- drop_ids(S, mt, k)
+      
+      # Preserve the original panel for every draw.
+      d <- D[!pixel_id %in% ids]
+      
+      if (uniqueN(d$treated) < 2L) {
+        warning("Skipping ", y, ", ", mt, ", k = ", k,
+                ": one treatment group is absent.")
+        next
+      }
+      
+      if (uniqueN(d$cluster) < 2L) {
+        warning("Skipping ", y, ", ", mt, ", k = ", k,
+                ": fewer than two clusters remain.")
+        next
+      }
+      
+      a <- fit_att(y, d)
+      
+      n_t <- P[pixel_id %in% ids & treated == 1L, .N]
+      n_c <- P[pixel_id %in% ids & treated == 0L, .N]
+      n_t_all <- P[treated == 1L, .N]
+      
+      filtered_p <- pre_p(y, d)
+      filtered_slope <- pre_gap_slope(y, d)
+      
+      relative_change <- if (
+        is.finite(full_att) && abs(full_att) > 1e-10
+      ) {
+        100 * (as.numeric(a[["att"]]) / full_att - 1)
+      } else {
+        NA_real_
+      }
+      
+      counter <- counter + 1L
+      
+      grid_list[[counter]] <- data.table(
+        outcome = y,
+        metric = mt,
+        k = k,
+        
+        removed_treated = n_t,
+        removed_comparison = n_c,
+        
+        share_treated_removed_pct = if (n_t_all > 0L) {
+          round(100 * n_t / n_t_all, 1)
+        } else {
+          NA_real_
+        },
+        
+        att_full = full_att,
+        att_filtered = as.numeric(a[["att"]]),
+        se_filtered = as.numeric(a[["se"]]),
+        lo = as.numeric(a[["lo"]]),
+        hi = as.numeric(a[["hi"]]),
+        
+        rel_change_pct = round(relative_change, 1),
+        
+        pretrend_p_full = as.numeric(base[[y]]$p),
+        pretrend_p_filtered = filtered_p,
+        
+        pre_gap_slope_full = as.numeric(base[[y]]$gs),
+        pre_gap_slope_filtered = filtered_slope
+      )
+    }
+  }
+}
+
+if (!length(grid_list)) {
+  stop("The sensitivity grid produced no valid results.")
+}
+
+grid <- rbindlist(grid_list, fill = TRUE)
+
+print(grid[metric == main_metric], digits = 3)
+save_tab(grid, "S10_sensitivity_grid")
+
+
+# ---------------------------- 5. TABLE S10 -------------------------------
+
+cat("\n===== TABLE S10 =====\n")
+
+main <- grid[
+  metric == main_metric & abs(k - main_k) < 1e-8
+]
+
+if (!nrow(main)) {
+  stop("No Table S10 rows. Check main_metric and main_k.")
+}
+
+tabS10 <- main[, .(
+  Outcome = outcome,
+  
+  `Units removed (treated; comparison)` =
+    paste0(removed_treated, "; ", removed_comparison),
+  
+  `Estimate with filter (beta, 95% CI)` =
+    sprintf("%.3g [%.3g, %.3g]", att_filtered, lo, hi),
+  
+  `Estimate without filter (beta, 95% CI)` =
+    vapply(
+      outcome,
+      function(o) fmt_ci(base[[o]]$att),
+      character(1)
+    ),
+  
+  `Relative change (%)` = rel_change_pct,
+  
+  `Joint pre-period test p (with; without)` =
+    sprintf("%.3g; %.3g", pretrend_p_filtered, pretrend_p_full)
+)]
+
+print(tabS10)
+save_tab(tabS10, "TableS10")
+
+
+# ---------------------------- 6. RANDOM-REMOVAL BENCHMARK -----------------
+
+cat("\n===== Random-removal benchmark =====\n")
+
+bench_list <- list()
+
+for (y in outcomes) {
+  
+  r <- main[outcome == y]
+  
+  if (nrow(r) != 1L) {
+    warning("Skipping benchmark for ", y,
+            ": expected one main-threshold row.")
+    next
+  }
+  
+  n_t_drop <- as.integer(r$removed_treated[1])
+  n_c_drop <- as.integer(r$removed_comparison[1])
+  
+  ids_t <- P[treated == 1L, pixel_id]
+  ids_c <- P[treated == 0L, pixel_id]
+  
+  if (n_t_drop > length(ids_t) || n_c_drop > length(ids_c)) {
+    warning("Skipping benchmark for ", y,
+            ": requested removal exceeds available pixels.")
+    next
+  }
+  
+  sims_list <- vector("list", n_random)
+  
+  for (i in seq_len(n_random)) {
+    
+    ids <- c(
+      if (n_t_drop > 0L) sample(ids_t, n_t_drop) else ids_t[0],
+      if (n_c_drop > 0L) sample(ids_c, n_c_drop) else ids_c[0]
+    )
+    
+    d <- D[!pixel_id %in% ids]
+    
+    if (uniqueN(d$treated) < 2L || uniqueN(d$cluster) < 2L) {
+      sims_list[[i]] <- data.table(att = NA_real_, p = NA_real_)
+      next
+    }
+    
+    sims_list[[i]] <- data.table(
+      att = as.numeric(fit_att(y, d)[["att"]]),
+      p = as.numeric(pre_p(y, d))
+    )
+  }
+  
+  sims <- rbindlist(sims_list)
+  
+  valid_att <- sims$att[is.finite(sims$att)]
+  
+  bench_list[[y]] <- data.table(
+    outcome = y,
+    att_filtered = as.numeric(r$att_filtered[1]),
+    att_full = as.numeric(r$att_full[1]),
+    
+    random_att_mean = if (length(valid_att)) {
+      mean(valid_att)
+    } else {
+      NA_real_
+    },
+    
+    random_att_sd = if (length(valid_att) > 1L) {
+      sd(valid_att)
+    } else {
+      NA_real_
+    },
+    
+    random_att_p05 = if (length(valid_att)) {
+      as.numeric(quantile(valid_att, 0.05))
+    } else {
+      NA_real_
+    },
+    
+    random_att_p95 = if (length(valid_att)) {
+      as.numeric(quantile(valid_att, 0.95))
+    } else {
+      NA_real_
+    },
+    
+    valid_random_draws = length(valid_att),
+    
+    share_random_draws_pretrend_p_gt_0.05 =
+      mean(sims$p > 0.05, na.rm = TRUE),
+    
+    pretrend_p_filtered = as.numeric(r$pretrend_p_filtered[1])
+  )
+}
+
+bench <- rbindlist(bench_list, fill = TRUE)
+
+print(bench, digits = 3)
+save_tab(bench, "S10_random_removal_benchmark")
+
+cat(
+  "\nInterpretation: Compare the filtered ATT with the distribution ",
+  "of randomly removed samples. This is a sensitivity benchmark, ",
+  "not proof of causal identification.\n",
+  sep = ""
+)
+
+
+# ---------------------------- 7. FIGURE 1: ATT VS THRESHOLD ---------------
+
+plot_grid <- grid[metric == main_metric]
+
+g1 <- ggplot(plot_grid, aes(x = k, y = att_filtered)) +
+  
+  geom_hline(
+    aes(yintercept = att_full),
+    linetype = "dashed",
+    color = "grey40"
+  ) +
+  
+  geom_pointrange(
+    aes(ymin = lo, ymax = hi),
+    linewidth = 0.4
+  ) +
+  
+  facet_wrap(~outcome, scales = "free_y") +
+  
+  scale_x_continuous(breaks = ks) +
+  
+  labs(
+    title = "Sensitivity of ATT to pre-treatment slope filtering",
+    x = "Filter threshold k (MAD units)",
+    y = "Filtered ATT (95% CI)"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(g1)
+
+ggsave(
+  file.path(out_dir, "S10_att_vs_k.png"),
+  plot = g1,
+  width = 10,
+  height = 6,
+  dpi = 600,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "S10_att_vs_k.tif"),
+  plot = g1,
+  width = 10,
+  height = 6,
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+
+# ---------------------------- 8. FIGURE 2: PRE-TREND P VS THRESHOLD --------
+
+g2 <- ggplot(
+  plot_grid[is.finite(pretrend_p_filtered) &
+              pretrend_p_filtered > 0],
+  aes(x = k, y = pretrend_p_filtered)
+) +
+  
+  geom_hline(
+    yintercept = 0.05,
+    linetype = "dotted",
+    color = "red"
+  ) +
+  
+  geom_line() +
+  geom_point(size = 2) +
+  
+  facet_wrap(~outcome) +
+  
+  scale_y_log10() +
+  scale_x_continuous(breaks = ks) +
+  
+  labs(
+    title = "Pre-trend test sensitivity to slope filtering",
+    x = "Filter threshold k (MAD units)",
+    y = "Joint pre-trend test p-value (log scale)"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(g2)
+
+ggsave(
+  file.path(out_dir, "S10_pretrend_p_vs_k.png"),
+  plot = g2,
+  width = 10,
+  height = 6,
+  dpi = 600,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "S10_pretrend_p_vs_k.tif"),
+  plot = g2,
+  width = 10,
+  height = 6,
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+
+# ---------------------------- 9. COMPLETION SUMMARY -----------------------
+
+cat("\n============================================================\n")
+cat("SENSITIVITY ANALYSIS COMPLETED\n")
+cat("============================================================\n")
+
+cat("Outcomes:", paste(outcomes, collapse = ", "), "\n")
+cat("Main filtering rule:", main_metric, "\n")
+cat("Main threshold k:", main_k, "\n")
+cat("Random-removal draws requested:", n_random, "\n")
+cat("Output directory:", normalizePath(out_dir, winslash = "/", mustWork = FALSE), "\n")
+
+cat("\nFiles written:\n")
+print(list.files(out_dir, pattern = "^S10_|^TableS10", full.names = TRUE))
+
+cat("\nRemember: slope filtering is a sensitivity analysis, not a replacement for the primary full-sample model.\n")
+
+
+
+
+# 12. TABLE OUTPUT
+# ===============================
+etable(es_lst, did_lst)
+
+
+
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(fixest)
+library(broom)
+library(patchwork)
+library(cobalt)     # SMD
+library(MatchIt)    # matching
+
+# (a) PROPENSITY SCORE OVERLAP
+df <- df %>%
+  group_by(pixel_id) %>%
+  mutate(
+    NDVI_pre = mean(NDVI[year < 2019], na.rm = TRUE),
+    LST_pre  = mean(LST[year < 2019], na.rm = TRUE),
+    ET_pre   = mean(ET[year < 2019], na.rm = TRUE)
+  ) %>%
+  ungroup()
+ps_model <- glm(
+  treated ~ elevation + slope + NDVI_pre + LST_pre,
+  data = df,
+  family = binomial()
+)
+
+df$pscore <- predict(ps_model, newdata = df, type = "response")
+
+p_ps <- ggplot(df, aes(pscore, fill = factor(treated))) +
+  geom_density(alpha = 0.4) +
+  scale_fill_manual(values = c("gray70", "black")) +
+  labs(
+    x = "Propensity score",
+    y = "Density",
+    title = "(a) Propensity score overlap"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top",
+        plot.title = element_text(face = "bold"))
+
+
+# (b) COVARIATE BALANCE (SMD)
+bal <- bal.tab(ps_model, un = TRUE)
+
+df_smd <- data.frame(
+  variable = rownames(bal$Balance),
+  before = bal$Balance$Diff.Un,
+  after  = bal$Balance$Diff.Adj
+) %>%
+  tidyr::pivot_longer(cols = c(before, after),
+                      names_to = "stage",
+                      values_to = "smd")
+
+p_smd <- ggplot(df_smd, aes(smd, reorder(variable, smd), shape = stage)) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 0.1, linetype = "dashed") +
+  labs(
+    x = "Standardized mean difference",
+    y = NULL,
+    title = "(b) Covariate balance"
+  ) +
+  theme_classic(base_size = 11)
+
+print(p_smd)
+# -------------------------------
+# -------------------------------
+# (S2a) Placebo Test
+# -------------------------------
+
+set.seed(123)
+
+placebo_results <- replicate(200, {
+  
+  df$fake_treat <- sample(df$treated)
+  
+  model <- feols(
+    LST_anom ~ fake_treat * post |
+      pixel_id + year,
+    data = df
+  )
+  
+  coef(model)["fake_treat:post"]
+})
+
+df_placebo <- data.frame(effect = placebo_results)
+null_sd <- sd(df_placebo$effect)
+true_eff <- coef(did_lst)["treated:post"]
+
+p_placebo <- ggplot(df_placebo, aes(effect)) +
+  
+  # Histogram (scaled to density so it aligns with curve)
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 30,
+                 fill = "grey75",
+                 color = "black",
+                 linewidth = 0.3) +
+  # 95% null band
+  annotate("rect",
+           xmin = -2*null_sd,
+           xmax =  2*null_sd,
+           ymin = 0,
+           ymax = Inf,
+           alpha = 0.08) +
+  
+  # z-score annotation
+  annotate("text",
+           x = true_eff,
+           y = max(density(df_placebo$effect)$y),
+           label = paste0("~", round(abs(true_eff)/null_sd,1), " SD"),
+           hjust = -0.1,
+           size = 3)+
+  
+  # 🔴 Kernel density curve (trend line)
+  geom_density(linewidth = 1) +
+  
+  # Zero reference
+  geom_vline(xintercept = 0,
+             linetype = "dashed",
+             linewidth = 0.6) +
+  
+  # Actual DiD estimate
+  geom_vline(xintercept = coef(did_lst)["treated:post"],
+             color = "black",
+             linewidth = 1) +
+  
+  labs(
+    x = "Placebo treatment effect",
+    y = "Density",
+  ) +
+  
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )+theme_pub
+print(p_placebo)
+# -------------------------------
+# (S2b) Event-study with trends
+# -------------------------------
+es_trend <- feols(
+  LST_anom ~ i(event_time, treated, ref = -1) |
+    pixel_id + year + pixel_id[year],
+  data = df
+)
+
+df_es_trend <- broom::tidy(es_trend, conf.int = TRUE) %>%
+  filter(grepl("event_time::", term)) %>%
+  mutate(event_time = as.numeric(gsub(".*::(-?[0-9]+).*", "\\1", term)))
+
+p_trend <- ggplot(df_es_trend, aes(event_time, estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = -1, linetype = "dotted") +
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  labs(
+    x = "Event time",
+    y = "Effect",
+    title = "(d)"
+  ) +
+  theme_classic()+theme_pub
+
+fig_S2 <- p_placebo | p_trend
+fig_S2
+# 11. EXPORT
+# ===============================
+ggsave("Placebo Test .png",
+       p_placebo,
+       width = 10,
+       height = 4,
+       dpi = 600)
+
+
+#SENSITIVITY ANALYSIS
+thresholds <- seq(10, 50, 10)
+
+df_thresh <- lapply(thresholds, function(th){
+  
+  df_tmp <- df %>%
+    mutate(treated_alt = ifelse(tree_cover > th, 1, 0))
+  
+  model <- feols(
+    LST_anom ~ treated_alt * post |
+      pixel_id + year,
+    data = df_tmp
+  )
+  
+  data.frame(
+    threshold = th,
+    estimate = coef(model)["treated_alt:post"],
+    se = se(model)["treated_alt:post"]
+  )
+}) %>% bind_rows()
+
+p_thresh <- ggplot(df_thresh, aes(threshold, estimate)) +
+  geom_line() +
+  geom_point() +
+  geom_errorbar(aes(
+    ymin = estimate - 1.96 * se,
+    ymax = estimate + 1.96 * se
+  ), width = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Tree cover threshold (%)",
+    y = "Effect",
+    title = "(e) Threshold sensitivity"
+  ) +
+  theme_classic(base_size = 11)
+m1 <- feols(LST_anom ~ treated*post | pixel_id + year, df)
+m2 <- feols(LST_anom ~ treated*post + NDVI_anom + albedo |
+              pixel_id + year, df)
+m3 <- feols(LST_anom ~ treated*post + NDVI_anom + albedo |
+              pixel_id + year + pixel_id[year], df)
+
+df_models <- bind_rows(
+  tidy(m1) %>% filter(term == "treated:post") %>% mutate(model = "Baseline"),
+  tidy(m2) %>% filter(term == "treated:post") %>% mutate(model = "Controls"),
+  tidy(m3) %>% filter(term == "treated:post") %>% mutate(model = "Trends")
+)
+
+p_model <- ggplot(df_models, aes(estimate, model)) +
+  geom_point(size = 2) +
+  geom_errorbarh(aes(
+    xmin = estimate - 1.96 * std.error,
+    xmax = estimate + 1.96 * std.error
+  ), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Estimated effect",
+    y = NULL,
+    title = "(f) Model sensitivity"
+  ) +
+  theme_classic(base_size = 11)
+print(p_model)
+final_S <- (p_ps | p_smd) /
+  (p_placebo | p_pretrend) /
+  (p_thresh | p_model) +
+  plot_annotation(
+    title = "Supplementary Figure S1–S3. Robustness and validation of afforestation impacts",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 12)
+    )
+  )
+
+final_S
+
+# =========================================================
+# 11. HETEROGENEITY-ROBUST DiD ESTIMATION
+# =========================================================
+# 11. HETEROGENEITY-ROBUST DiD ESTIMATION
+# Callaway & Sant'Anna + Sun & Abraham + Goodman-Bacon
+# =========================================================
+
+library(dplyr)
+library(did)
+library(fixest)
+library(bacondecomp)
+
+# =========================================================
+# CREATE NUMERIC PANEL ID
+# =========================================================
+
+df <- df %>%
+  mutate(
+    pixel_numeric = as.numeric(as.factor(pixel_id))
+  )
+
+# =========================================================
+# DERIVE FIRST TREATMENT YEAR FROM EVENT TIME
+# =========================================================
+
+# For treated pixels:
+# treat_year = calendar year - event time
+
+df <- df %>%
+  mutate(
+    treat_year = ifelse(
+      treated == 1,
+      year - event_time,
+      0
+    )
+  )
+
+# =========================================================
+# ENSURE TREATMENT YEAR IS CONSTANT WITHIN PIXEL
+# =========================================================
+
+treat_lookup <- df %>%
+  filter(treated == 1) %>%
+  group_by(pixel_id) %>%
+  summarise(
+    treat_year = min(treat_year, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Merge stable treatment year
+df <- df %>%
+  select(-treat_year) %>%
+  left_join(treat_lookup, by = "pixel_id")
+
+# Never-treated units = 0
+df <- df %>%
+  mutate(
+    treat_year = ifelse(is.na(treat_year), 0, treat_year),
+    treat_year = as.integer(treat_year)
+  )
+
+# =========================================================
+# DIAGNOSTIC CHECK
+# =========================================================
+
+table(df$treat_year)
+
+# Should show:
+# 0 2019 2020 2021 2022 2023 2024
+
+# =========================================================
+# REMOVE MISSING VALUES
+# =========================================================
+
+df_did <- df %>%
+  filter(
+    !is.na(NDVI_anom),
+    !is.na(ET_anom),
+    !is.na(LST_anom),
+    !is.na(P_mm),
+    !is.na(rootzone_sm),
+    !is.na(treat_year)
+  )
+
+# =========================================================
+# CALLAWAY & SANT'ANNA ESTIMATOR
+# =========================================================
+
+cs_ndvi <- att_gt(
+  yname   = "NDVI_anom",
+  tname   = "year",
+  idname  = "pixel_numeric",
+  gname   = "treat_year",
+  xformla = ~ P_mm + rootzone_sm,
+  data    = df_did,
+  
+  control_group = "notyettreated",
+  est_method    = "dr",
+  panel         = TRUE
+)
+
+# Dynamic event-study aggregation
+agg_ndvi <- aggte(
+  cs_ndvi,
+  type = "dynamic"
+)
+
+summary(agg_ndvi)
+
+# =========================================================
+# SUN & ABRAHAM ESTIMATOR
+# =========================================================
+
+sa_ndvi <- feols(
+  NDVI_anom ~ sunab(treat_year, year) |
+    pixel_id + year,
+  cluster = ~pixel_id,
+  data = df_did
+)
+
+summary(sa_ndvi)
+
+# =========================================================
+# GOODMAN-BACON DECOMPOSITION
+# =========================================================
+
+bacon_ndvi <- bacon(
+  NDVI_anom ~ treated,
+  data = df_did,
+  id_var = "pixel_numeric",
+  time_var = "year"
+)
+
+summary(bacon_ndvi)
+
+
+library(data.table)
+library(fixest)
+library(sf)
+library(spdep)
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+
+df <- fread("D:/Ecohydrology/DiD_EventStudy_Panel_FINAL (done).csv")
+
+# Keep one year for spatial test
+df_sp <- df[year == 2025]
+
+# Convert geometry if needed
+df_sp <- st_as_sf(df_sp, wkt = ".geo", crs = 4326)
+
+# =========================================================
+# TWFE MODELS
+# =========================================================
+
+m_ndvi <- feols(NDVI ~ treated*post | pixel_id + year, data = df)
+m_lst  <- feols(LST  ~ treated*post | pixel_id + year, data = df)
+m_et   <- feols(ET   ~ treated*post | pixel_id + year, data = df)
+
+# Residuals
+df_sp$ndvi_resid <- residuals(m_ndvi)[df$year == 2024]
+df_sp$lst_resid  <- residuals(m_lst)[df$year == 2024]
+df_sp$et_resid   <- residuals(m_et)[df$year == 2024]
+
+# =========================================================
+# SPATIAL WEIGHTS
+# =========================================================
+
+coords <- st_coordinates(df_sp)
+
+nb <- knn2nb(knearneigh(coords, k = 8))
+lw <- nb2listw(nb, style = "W")
+
+# =========================================================
+# MORAN'S I
+# =========================================================
+
+moran_ndvi <- moran.mc(df_sp$ndvi_resid, lw, nsim = 999)
+moran_lst  <- moran.mc(df_sp$lst_resid,  lw, nsim = 999)
+moran_et   <- moran.mc(df_sp$et_resid,   lw, nsim = 999)
+
+print(moran_ndvi)
+print(moran_lst)
+print(moran_et)
+
+install.packages("pandoc")
+library(fixest)
+library(pandoc)
+# Event-study model
+m_ndvi <- feols(
+  NDVI ~ i(event_time, treated, ref = -1) |
+    pixel_id + year,
+  cluster = ~pixel_id,
+  data = df
+)
+
+library(fixest)
+library(dplyr)
+library(tidyr)
+library(stringi)
+library(modelsummary)
+
+# =========================
+# 0. LOAD LIBRARIES
+# =========================
+library(fixest)
+library(modelsummary)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(stringi)
+
+# =========================
+# 1. EVENT-STUDY MODELS
+# =========================
+
+m_ndvi <- feols(
+  NDVI ~ i(event_time, treated, ref = -1) |
+    pixel_id + year,
+  cluster = ~pixel_id,
+  data = df
+)
+
+m_lst <- feols(
+  LST ~ i(event_time, treated, ref = -1) |
+    pixel_id + year,
+  cluster = ~pixel_id,
+  data = df
+)
+
+m_et <- feols(
+  ET ~ i(event_time, treated, ref = -1) |
+    pixel_id + year,
+  cluster = ~pixel_id,
+  data = df
+)
+
+# =========================
+# 2. PRE-TREND (WALD TESTS)
+# =========================
+# safer regex: match lag coefficients explicitly
+
+wald_ndvi <- wald(m_ndvi, keep = "event_time::-4|event_time::-3|event_time::-2")
+wald_lst  <- wald(m_lst,  keep = "event_time::-4|event_time::-3|event_time::-2")
+wald_et   <- wald(m_et,   keep = "event_time::-4|event_time::-3|event_time::-2")
+
+print(wald_ndvi)
+print(wald_lst)
+print(wald_et)
+
+# =========================
+# 3. MODEL SUMMARY EXPORT
+# =========================
+
+models <- list(
+  NDVI = m_ndvi,
+  LST  = m_lst,
+  ET   = m_et
+)
+
+modelsummary(
+  models,
+  stars = TRUE,
+  statistic = "({std.error})",
+  gof_omit = "AIC|BIC|Log.Lik|RMSE",
+  output = "event_study_three_models.docx"
+)
+tab <- modelsummary(
+  models,
+  stars = TRUE,
+  output = "data.frame"
+)
+
+write.csv(tab, "event_study_three_models.csv", row.names = FALSE)
+# safer CSV export (avoids Windows lock issues)
+write.csv(
+  modelsummary(models, stars = TRUE),
+  "event_study_three_models.csv",
+  row.names = FALSE
+)
+
+# =========================
+# 4. CLEAN EVENT-STUDY DATA (FIXED PIPELINE)
+# =========================
+
+library(broom)
+
+df_clean <- bind_rows(
+  tidy(m_ndvi) %>% mutate(outcome = "NDVI"),
+  tidy(m_lst)  %>% mutate(outcome = "LST"),
+  tidy(m_et)   %>% mutate(outcome = "ET")
+) %>%
+  filter(str_detect(term, "event_time")) %>%
+  mutate(
+    event_time = as.numeric(str_extract(term, "-?\\d+"))
+  ) %>%
+  arrange(outcome, event_time)
+
+write.csv(df_clean, "event_study_clean_table.csv", row.names = FALSE)
+
+library(dplyr)
+
+df_table <- df_clean %>%
+  mutate(
+    period = case_when(
+      event_time %in% c(-4, -3, -2) ~ "pre",
+      event_time >= 0 ~ "post",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(period)) %>%
+  group_by(outcome, period) %>%
+  summarise(
+    mean_effect = mean(estimate, na.rm = TRUE),
+    abs_mean_effect = mean(abs(estimate), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = period,
+    values_from = abs_mean_effect
+  ) %>%
+  mutate(
+    post_pre_ratio = post / pre
+  )
+
+df_table
+
+wald_table <- data.frame(
+  outcome = c("NDVI", "LST", "ET"),
+  wald_stat = c(wald_ndvi$stat, wald_lst$stat, wald_et$stat),
+  p_value = c(wald_ndvi$p, wald_lst$p, wald_et$p)
+)
+
+final_table <- left_join(df_table, wald_table, by = "outcome")
+final_table
+# =========================
+
+
+
+
+
