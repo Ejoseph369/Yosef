@@ -6,7 +6,6 @@
 // Clusters: ERA5-Land cell (climate_cluster) + HydroSHEDS L7
 // Budyko: HydroSHEDS L12, ≥90% inside BMER; ET−P in R
 // Seasons: wet = Jun–Sep; dry = Oct–May
-// No MOD16 PET, no CWD, no SMAP zero-fill, no N_initial/N_final
 // ============================================================
 
 // ===============================
@@ -16,7 +15,7 @@ var OUTCOME_GRID = 'NDVI';   // 'NDVI' | 'ET' | 'Albedo' | 'LST'
 var INTENSITY_THRESH = 0.10; // exposed if intensity ≥ 0.10
 var BUFFER_METERS = 500;     // m buffer around exposed for comparison
 var DW_SCALE = 10;           // Dynamic World scale (m)
-var START_YEAR = 2010;
+var START_YEAR = 2015;
 var END_YEAR   = 2025;
 var TILE_DEG   = 0.5;
 
