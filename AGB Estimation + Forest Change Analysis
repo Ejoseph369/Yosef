@@ -1,0 +1,951 @@
+/*******************************************************************************
+  AGB Estimation + Forest Change Analysis
+  Integrated with Dynamic World Treatment/Control
+  
+*******************************************************************************/
+
+// ============================================================================
+// 1. INITIALIZATION
+// ============================================================================
+var roi = ee.FeatureCollection('projects/ee-yosef369/assets/Study_Area');
+Map.centerObject(roi, 8);
+Map.addLayer(roi, {}, 'ROI');
+
+var dem = ee.Image('USGS/SRTMGL1_003');
+var slope = ee.Terrain.slope(dem);
+var slopeOk = slope.lte(30);      // GEDI calibration domain
+var slopeSteep = slope.gt(30);
+
+// ============================================================================
+// 2. DYNAMIC WORLD — FOREST STATES + TREATMENT / CONTROL
+// ============================================================================
+var dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+  .filterBounds(roi)
+  .filterDate('2015-01-01', '2025-12-31');
+
+function dwForestYear(year) {
+  year = ee.Number(year);
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+  var dwYear = dw.filterDate(start, end).select('trees');
+  return ee.Image(ee.Algorithms.If(
+    dwYear.size().gt(0),
+    dwYear.mean().rename('forest_prob')
+      .set('year', year)
+      .set('system:time_start', start.millis()),
+    null
+  ));
+}
+
+var yearsAll = ee.List.sequence(2015, 2025);
+var forestIC = ee.ImageCollection.fromImages(
+  yearsAll.map(dwForestYear)
+).filter(ee.Filter.notNull(['year']));
+
+print('DW annual forest probability years:', forestIC.size());
+
+// ============================================================
+// TREATMENT, CONTROL, AND BASELINE LAND-COVER ORIGIN
+// ============================================================
+
+// 1. Baseline and post-intervention periods
+var pre = forestIC.filter(
+  ee.Filter.calendarRange(2015, 2018, 'year')
+);
+
+var post = forestIC.filter(
+  ee.Filter.calendarRange(2019, 2025, 'year')
+);
+
+print('Pre-period image count:', pre.size());
+print('Post-period image count:', post.size());
+
+// 2. Mean annual forest probability
+var preMean = pre.mean().rename('pre_forest');
+var postMean = post.mean().rename('post_forest');
+
+// 3. Binary forest states
+var preForest = preMean.gte(0.6);
+var postForest = postMean.gte(0.6);
+
+// 4. Treatment and control definitions
+// Treatment: non-forest at baseline, forest in post-period
+var treated = preForest.not()
+  .and(postForest)
+  .rename('treated');
+
+// Control: non-forest in both periods
+var control = preForest.not()
+  .and(postForest.not())
+  .rename('control');
+
+var hasBothData = pre.size().gt(0).and(post.size().gt(0));
+
+// ============================================================
+// 5. BASELINE LAND-COVER ORIGIN 
+// ============================================================
+
+var baselineLabels = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+  .filterBounds(roi)
+  .filterDate('2015-01-01', '2019-01-01')
+  .select('label');
+
+var baselineLC = baselineLabels.mode()
+  .rename('baseline_lc')
+  .clip(roi);
+
+// Dynamic World: 4 = crops, 2 = grass, 5 = shrub/scrub
+var isCropland = baselineLC.eq(4)
+  .rename('baseline_cropland')
+  .clip(roi);
+
+var isRangeland = baselineLC.eq(2)
+  .or(baselineLC.eq(5))
+  .rename('baseline_rangeland')
+  .clip(roi);
+
+// ============================================================
+// 6. ELIGIBLE MATCHING POPULATION — CLIPPED TO ROI
+// ============================================================
+
+var matchUniverse = preForest.not()
+  .and(isCropland.or(isRangeland))
+  .rename('match_universe')
+  .clip(roi);
+
+// ============================================================
+// 7. ELIGIBLE TREATMENT AND CONTROL 
+// ============================================================
+
+// Treatment: baseline non-forest → post-period forest
+var treatedEligible = treated
+  .and(matchUniverse)
+  .rename('treated_eligible')
+  .clip(roi);
+
+// Control: stable non-forest with eligible baseline origin
+var controlEligible = control
+  .and(matchUniverse)
+  .rename('control_eligible')
+  .clip(roi);
+
+// ============================================================
+// 8. TREATMENT MAP — CLIPPED TO ROI
+// 1 = treatment; 0 = control; masked = excluded
+// ============================================================
+
+var treatmentMap = treatedEligible.multiply(1)
+  .where(controlEligible, 0)
+  .updateMask(treatedEligible.or(controlEligible))
+  .rename('treatment')
+  .clip(roi);
+
+// ============================================================
+// 9. DISPLAY LAYERS
+// ============================================================
+
+Map.centerObject(roi, 8);
+
+Map.addLayer(
+  baselineLC,
+  {
+    min: 0,
+    max: 8,
+    palette: [
+      '419BDF', '397D49', '88B053',
+      '7A87C6', 'E49635', 'DFC35A',
+      'C4281B', 'A59B8F', 'B39FE1'
+    ]
+  },
+  'Baseline land cover (2016–2018)',
+  false
+);
+
+Map.addLayer(
+  matchUniverse.selfMask().clip(roi),
+  {palette: ['yellow']},
+  'Eligible matching population',
+  false
+);
+
+Map.addLayer(
+  treatedEligible.selfMask().clip(roi),
+  {palette: ['red']},
+  'Eligible treatment: non-forest to forest',
+  true
+);
+
+Map.addLayer(
+  controlEligible.selfMask().clip(roi),
+  {palette: ['blue']},
+  'Eligible control: stable non-forest',
+  true
+);
+
+Map.addLayer(
+  treatmentMap.clip(roi),
+  {
+    min: 0,
+    max: 1,
+    palette: ['blue', 'red']
+  },
+  'Treatment (1) / Control (0)',
+  false
+);
+// ============================================================================
+// 4. GEDI DATA + QUALITY FILTER 
+// ============================================================================
+var gedi = ee.ImageCollection('LARSE/GEDI/GEDI04_A_002_MONTHLY')
+  .filterBounds(roi)
+  .filterDate('2019-01-01', '2025-12-31');
+
+print('Original GEDI images:', gedi.size());
+
+var gediFiltered = gedi.map(function(img) {
+  img = ee.Image(img);
+  var qualityMask =
+    img.select('l4_quality_flag').eq(1)
+    .and(img.select('degrade_flag').eq(0))
+    .and(img.select('sensitivity').gte(0.95))
+    .and(img.select('solar_elevation').lt(0))   // night-time
+    .and(img.select('agbd').gt(5))
+    .and(img.select('agbd').lt(350))
+    .and(img.select('agbd_se').divide(img.select('agbd')).lte(0.5))
+    .and(slope.lte(30));
+  return img.updateMask(qualityMask)
+    .select(['agbd', 'agbd_se'])
+    .copyProperties(img, ['system:time_start']);
+});
+
+// ============================================================================
+// 5.  FILTERING CASCADE 
+// ============================================================================
+function pixelCount(collection) {
+  return ee.Number(
+    collection.select('agbd')
+      .map(function(img) {
+        return img.mask().gt(0).rename('count');
+      })
+      .sum()
+      .reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry: roi,
+        scale: 25,
+        maxPixels: 1e13
+      }).get('count')
+  );
+}
+
+var originalCount = ee.Number(
+  gedi.select('agbd')
+    .map(function(img) { return img.select('agbd').gt(0).rename('count'); })
+    .sum()
+    .reduceRegion({
+      reducer: ee.Reducer.sum(), geometry: roi, scale: 25, maxPixels: 1e13
+    }).get('count')
+);
+
+var step1 = gedi.map(function(img) {
+  return img.updateMask(img.select('l4_quality_flag').eq(1));
+});
+var step1Count = pixelCount(step1);
+
+var step2 = step1.map(function(img) {
+  return img.updateMask(img.select('degrade_flag').eq(0));
+});
+var step2Count = pixelCount(step2);
+
+var step3 = step2.map(function(img) {
+  return img.updateMask(img.select('sensitivity').gte(0.95));
+});
+var step3Count = pixelCount(step3);
+
+// Night-time step (was missing from Table 2.2)
+var step4 = step3.map(function(img) {
+  return img.updateMask(img.select('solar_elevation').lt(0));
+});
+var step4Count = pixelCount(step4);
+
+var step5 = step4.map(function(img) {
+  return img.updateMask(img.select('agbd').gt(5).and(img.select('agbd').lt(350)));
+});
+var step5Count = pixelCount(step5);
+
+var step6 = step5.map(function(img) {
+  return img.updateMask(
+    img.select('agbd_se').divide(img.select('agbd')).lte(0.5)
+  );
+});
+var step6Count = pixelCount(step6);
+
+var step7 = step6.map(function(img) {
+  return img.updateMask(slope.lte(30));
+});
+var step7Count = pixelCount(step7);
+
+function makeFeature(step, count) {
+  return ee.Feature(null, {
+    Filtering_Step: step,
+    Retained_Observations: count,
+    Retained_Percentage: count.divide(originalCount).multiply(100)
+  });
+}
+
+var summaryTable = ee.FeatureCollection([
+  makeFeature('Initial GEDI observations', originalCount),
+  makeFeature('1. Quality flag = 1', step1Count),
+  makeFeature('2. Degrade flag = 0', step2Count),
+  makeFeature('3. Sensitivity ≥ 0.95', step3Count),
+  makeFeature('4. Night-time (solar elevation < 0°)', step4Count),
+  makeFeature('5. AGB 5–350 Mg/ha', step5Count),
+  makeFeature('6. Relative uncertainty ≤ 50%', step6Count),
+  makeFeature('7. Slope ≤ 30°', step7Count)
+]);
+print('GEDI filtering cascade (Table 2.2):', summaryTable);
+
+Export.table.toDrive({
+  collection: summaryTable,
+  description: 'GEDI_Filtering_Cascade_Table2_2',
+  fileFormat: 'CSV'
+});
+
+print('Retention % (final / original):',
+  step7Count.divide(originalCount).multiply(100));
+
+// ============================================================================
+// 6. SEPTEMBER–OCTOBER SEASONAL COMPOSITES
+// ============================================================================
+var years = ee.List.sequence(2019, 2025);
+
+var gediAnnual = ee.ImageCollection.fromImages(
+  years.map(function(y) {
+    var start = ee.Date.fromYMD(y, 9, 1);
+    var end = ee.Date.fromYMD(y, 10, 31);
+    var yearCollection = gediFiltered.filterDate(start, end);
+    var count = yearCollection.size();
+    return ee.Image(ee.Algorithms.If(
+      count.gte(3),
+      yearCollection.median().set({
+        year: y,
+        'system:time_start': start.millis(),
+        observation_count: count
+      }),
+      ee.Image.constant(0).set({
+        year: y,
+        'system:time_start': start.millis(),
+        masked: 1
+      })
+    ));
+  })
+).filter(ee.Filter.neq('masked', 1));
+
+print('GEDI seasonal composites:', gediAnnual.size());
+
+// ============================================================================
+// 7. 500 m CELL HETEROGENEITY FILTER (CV)
+// ============================================================================
+var gediPoints = gediFiltered.map(function(img) {
+  return img.select('agbd').sample({
+    region: roi,
+    scale: 25,
+    geometries: true,
+    tileScale: 4
+  });
+}).flatten();
+print('GEDI points:', gediPoints.size());
+
+var roiGeom = roi.geometry();
+var proj500 = ee.Projection('EPSG:4326').atScale(500);
+var lonLatGrid = ee.Image.pixelLonLat().reproject(proj500);
+var gridImage = lonLatGrid.select('longitude').multiply(100000)
+  .add(lonLatGrid.select('latitude').multiply(1000))
+  .toInt().rename('grid_id');
+
+var grid = gridImage.reduceToVectors({
+  geometry: roiGeom,
+  scale: 500,
+  geometryType: 'polygon',
+  reducer: ee.Reducer.countEvery(),
+  maxPixels: 1e13
+});
+print('500 m grid cells:', grid.size());
+
+var joined = ee.Join.saveAll('points').apply({
+  primary: grid,
+  secondary: gediPoints,
+  condition: ee.Filter.intersects({leftField: '.geo', rightField: '.geo'})
+});
+
+var cellStats = ee.FeatureCollection(joined.map(function(f) {
+  var pts = ee.FeatureCollection(ee.List(f.get('points')));
+  var count = pts.size();
+  var mean = ee.Number(pts.aggregate_mean('agbd'));
+  var sd = ee.Number(pts.aggregate_total_sd('agbd'));
+  var cv = sd.divide(mean).multiply(100);
+  return f.set({n: count, mean_agbd: mean, sd_agbd: sd, cv: cv});
+}));
+
+var validCells = cellStats.filter(ee.Filter.gte('n', 3));
+var filteredCells = validCells.filter(ee.Filter.lt('cv', 40));
+print('Initial 500 m cells (n≥3):', validCells.size());
+print('Retained CV-filtered cells:', filteredCells.size());
+print('CV-filter retention %:',
+  ee.Number(filteredCells.size()).divide(validCells.size()).multiply(100));
+
+Map.addLayer(filteredCells, {}, 'CV-filtered GEDI cells', false);
+
+// ============================================================================
+// 8. SENTINEL-2 INDICES
+// ============================================================================
+function addS2Indices(img) {
+  var proj10m = img.select('B8').projection();
+  var savi = img.expression(
+    '((NIR - RED) / (NIR + RED + L)) * (1 + L)', {
+      NIR: img.select('B8'), RED: img.select('B4'), L: 0.5
+    }).rename('SAVI');
+  var rendvi = img.normalizedDifference(['B8A', 'B5']).rename('RENDVI');
+  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var evi = img.expression(
+    '2.5*((NIR-RED)/(NIR+6*RED-7.5*BLUE+1))', {
+      NIR: img.select('B8'), RED: img.select('B4'), BLUE: img.select('B2')
+    }).rename('EVI');
+  var indices = ee.Image.cat([savi, rendvi, ndvi, evi])
+    .reproject({crs: proj10m, scale: 10});
+  return img.addBands(indices);
+}
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(roi)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .map(addS2Indices)
+  .select(['NDVI', 'EVI', 'SAVI', 'RENDVI']);
+
+// ============================================================================
+// 9. SENTINEL-1 SAR
+// ============================================================================
+function addSAR(img) {
+  var vv = img.select('VV');
+  var vh = img.select('VH');
+  // Ratio must match training and 2025 prediction
+  var ratio = vv.divide(vh).rename('VV_VH');
+  return img.addBands(ratio);
+}
+
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(roi)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .map(function(img) {
+    return img.select(['VV', 'VH'])
+      .copyProperties(img, ['system:time_start']);
+  })
+  .map(addSAR);
+
+// ============================================================================
+// 10. ANNUAL PREDICTOR STACK
+// ============================================================================
+var predictorStack = gediAnnual.map(function(img) {
+  var year = ee.Number(img.get('year'));
+  var startDate = ee.Date.fromYMD(year, 1, 1);
+  var endDate = ee.Date.fromYMD(year, 12, 31);
+  var s2Year = s2.filterDate(startDate, endDate).median();
+  var s1Year = s1.filterDate(startDate, endDate).median();
+  return img.addBands(s2Year).addBands(s1Year)
+    .clip(roi)
+    .set('year', year)
+    .set('system:time_start', img.get('system:time_start'));
+});
+print('Predictor stack size:', predictorStack.size());
+
+// ============================================================================
+// 11. TRAINING / VALIDATION + RF
+// ============================================================================
+var training = predictorStack.map(function(img) {
+  return img.sample({
+    region: roi,
+    scale: 25,
+    numPixels: 20000,
+    geometries: true,
+    tileScale: 4
+  });
+}).flatten();
+
+var split = training.randomColumn('random', 42);
+var trainingSet = split.filter(ee.Filter.lt('random', 0.7));
+var validationSet = split.filter(ee.Filter.gte('random', 0.7));
+print('Training samples:', trainingSet.size());
+print('Validation samples:', validationSet.size());
+
+// ========== DEFINE PREDICTORS AND TRAIN RF ==========
+var predictors = ['NDVI', 'EVI', 'VV', 'VH', 'VV_VH'];
+
+var rf = ee.Classifier.smileRandomForest({
+  numberOfTrees: 500,
+  minLeafPopulation: 5,
+  bagFraction: 0.7,
+  seed: 42
+}).setOutputMode('REGRESSION');
+
+var trainedRF = rf.train({
+  features: trainingSet,
+  classProperty: 'agbd',
+  inputProperties: predictors
+});
+
+var rfUncertainty = ee.Classifier.smileRandomForest({
+  numberOfTrees: 500,
+  minLeafPopulation: 5,
+  bagFraction: 0.7,
+  seed: 42
+}).setOutputMode('RAW');
+
+var trainedRFUncertainty = rfUncertainty.train({
+  features: trainingSet,
+  classProperty: 'agbd',
+  inputProperties: predictors
+});
+
+// Validation
+var validated = validationSet.classify(trainedRF);
+var errorFC = validated.map(function(feature) {
+  var agbd_val = ee.Number(feature.get('agbd'));
+  var pred_val = ee.Number(feature.get('classification'));
+  var error = agbd_val.subtract(pred_val);
+  return feature.set({error: error, error_sq: error.pow(2)});
+});
+
+var errorStats = errorFC.reduceColumns({
+  reducer: ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.stdDev(), sharedInputs: true
+  }),
+  selectors: ['error']
+});
+var meanSquaredError = ee.Number(
+  errorFC.reduceColumns({reducer: ee.Reducer.mean(), selectors: ['error_sq']}).get('mean')
+);
+var rmse = meanSquaredError.sqrt();
+print('Validation Statistics [Mg/ha]:', {
+  'Mean Error (Bias)': errorStats.get('mean'),
+  'Std Dev': errorStats.get('stdDev'),
+  'RMSE': rmse
+});
+
+var ss_res = errorFC.aggregate_sum('error_sq');
+var agbd_mean = validationSet.aggregate_mean('agbd');
+var ss_tot = validationSet.map(function(feature) {
+  var d = ee.Number(feature.get('agbd')).subtract(agbd_mean);
+  return feature.set('diff_sq', d.pow(2));
+}).aggregate_sum('diff_sq');
+print('R-squared:', ee.Number(1).subtract(ss_res.divide(ss_tot)));
+
+// ============================================================================
+// 12. PREDICT AGB MAPS
+// ============================================================================
+var agbMaps = predictorStack.map(function(img) {
+  var agbPred = img.select(predictors).classify(trainedRF).rename('AGB_pred');
+  return agbPred
+    .set('year', img.get('year'))
+    .set('system:time_start', img.get('system:time_start'));
+});
+
+var agbUncertaintyMaps = predictorStack.map(function(img) {
+  var rawPred = img.select(predictors).classify(trainedRFUncertainty);
+  var treeStd = rawPred.arrayReduce(ee.Reducer.stdDev(), [0]).rename('AGB_std');
+  return treeStd
+    .set('year', img.get('year'))
+    .set('system:time_start', img.get('system:time_start'));
+});
+print('AGB maps created:', agbMaps.size());
+
+// ============================================================================
+// 13. AGB CHANGE 2019–2025
+// ============================================================================
+var has2019 = agbMaps.filter(ee.Filter.eq('year', 2019)).size().gt(0);
+var has2025 = agbMaps.filter(ee.Filter.eq('year', 2025)).size().gt(0);
+print('Has 2019 AGB map:', has2019);
+print('Has 2025 AGB map:', has2025);
+
+var agb2019 = agbMaps.filter(ee.Filter.eq('year', 2019)).first().rename('AGB_2019');
+var agb2025 = agbMaps.filter(ee.Filter.eq('year', 2025)).first().rename('AGB_2025');
+
+var deltaAGB = agb2025.subtract(agb2019).rename('Delta_AGB');
+var deltaAGB_clean = deltaAGB
+  .updateMask(agb2019.gt(5))
+  .updateMask(agb2025.gt(5))
+  .updateMask(deltaAGB.abs().lt(200));
+
+var agbChangeClass = deltaAGB_clean.expression(
+  "b('Delta_AGB') > 10 ? 1 : b('Delta_AGB') < -10 ? -1 : 0"
+).rename('AGB_change_class');
+
+// ============================================================================
+// 14. ISSUE 6 FIX — LAND-COVER AREA (ALL SLOPES) + CARBON (SLOPE ≤30°)
+// ============================================================================
+var treatedAreaAll = treated.multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(), geometry: roi, scale: 25, maxPixels: 1e13
+});
+var treatedAreaSteep = treated.and(slopeSteep).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(), geometry: roi, scale: 25, maxPixels: 1e13
+});
+var treatedAreaOk = treated.and(slopeOk).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(), geometry: roi, scale: 25, maxPixels: 1e13
+});
+
+print('Treated area ALL slopes (ha):',
+  ee.Number(treatedAreaAll.get('treated')).divide(10000));
+print('Treated area slope ≤30° (ha):',
+  ee.Number(treatedAreaOk.get('treated')).divide(10000));
+print('Treated area slope ≥30° (ha) — outside GEDI domain:',
+  ee.Number(treatedAreaSteep.get('treated')).divide(10000));
+
+var calculateStatistics = function(image, name) {
+  var stats = image.reduceRegion({
+    reducer: ee.Reducer.mean().combine({
+      reducer2: ee.Reducer.stdDev(), sharedInputs: true
+    }),
+    geometry: roi,
+    scale: 25,
+    maxPixels: 1e13
+  });
+  print(name + ' Statistics:', stats);
+  return stats;
+};
+
+// Primary carbon comparison — GEDI-supported domain only
+var treatedDelta_supported = deltaAGB_clean.updateMask(treated).updateMask(slopeOk);
+var controlDelta_supported = deltaAGB_clean.updateMask(control).updateMask(slopeOk);
+calculateStatistics(treatedDelta_supported, 'Treated ΔAGB (slope ≤30° ONLY — primary)');
+calculateStatistics(controlDelta_supported, 'Control ΔAGB (slope ≤30° ONLY — primary)');
+
+// Extrapolation sensitivity
+var treatedDelta_steep = deltaAGB_clean.updateMask(treated).updateMask(slopeSteep);
+calculateStatistics(treatedDelta_steep, 'Treated ΔAGB (slope ≥30° — EXTRAPOLATION)');
+
+if (hasBothData) {
+  calculateStatistics(agb2025.updateMask(treated).updateMask(slopeOk),
+    'AGB 2024 Treated (slope ≤30°)');
+  calculateStatistics(agb2025.updateMask(control).updateMask(slopeOk),
+    'AGB 2024 Control (slope ≤30°)');
+}
+
+// ============================================================================
+// 15. MAP LAYERS
+// ============================================================================
+Map.addLayer(
+  forestIC.filter(ee.Filter.eq('year', 2025)).first(),
+  {min: 0, max: 1, palette: ['white', 'green']},
+  'DW Forest Probability 2024', false
+);
+Map.addLayer(treated.updateMask(treated), {palette: '006400'}, 'Afforested (Treated)');
+Map.addLayer(control.updateMask(control), {palette: 'gray'}, 'Stable Non-Forest Control', false);
+Map.addLayer(agb2025, {min: 0, max: 300, palette: ['yellow', 'green', 'darkgreen']}, 'Predicted AGB 2025');
+Map.addLayer(agb2019, {min: 0, max: 300, palette: ['yellow', 'green', 'darkgreen']}, 'Predicted AGB 2019', false);
+Map.addLayer(deltaAGB_clean, {min: -100, max: 100, palette: ['red', 'white', 'darkgreen']}, 'ΔAGB 2019–2024');
+Map.addLayer(agbChangeClass, {min: -1, max: 1, palette: ['red', 'lightgray', 'green']}, 'AGB Gain/Loss/Stable', false);
+Map.addLayer(slopeOk.selfMask(), {palette: 'blue'}, 'Slope ≤30° domain', false);
+
+var uncertainty2025 = agbUncertaintyMaps.filter(ee.Filter.eq('year', 2025)).first();
+Map.addLayer(uncertainty2025, {min: 0, max: 50, palette: ['blue', 'yellow', 'red']}, 'AGB Uncertainty 2024', false);
+
+// ============================================================================
+// 16. EXPORTS — MAPS
+// ============================================================================
+Export.image.toDrive({
+  image: agb2025, description: 'AGB_RF_2025',
+  region: roi.geometry(), scale: 25, maxPixels: 1e13, fileFormat: 'GeoTIFF'
+});
+Export.image.toDrive({
+  image: agb2019, description: 'AGB_RF_2019',
+  region: roi.geometry(), scale: 25, maxPixels: 1e13, fileFormat: 'GeoTIFF'
+});
+Export.image.toDrive({
+  image: deltaAGB_clean, description: 'Delta_AGB_2019_2025',
+  region: roi.geometry(), scale: 25, maxPixels: 1e13, fileFormat: 'GeoTIFF'
+});
+Export.image.toDrive({
+  image: agbChangeClass, description: 'AGB_Gain_Loss_2019_2024',
+  region: roi.geometry(), scale: 25, maxPixels: 1e13, fileFormat: 'GeoTIFF'
+});
+Export.image.toDrive({
+  image: uncertainty2025, description: 'AGB_Uncertainty_2025',
+  region: roi.geometry(), scale: 25, maxPixels: 1e13, fileFormat: 'GeoTIFF'
+});
+Export.image.toDrive({
+  image: treatmentMap, description: 'Treatment_Control_Mask',
+  region: roi.geometry(), scale: 10, maxPixels: 1e13, fileFormat: 'GeoTIFF'
+});
+Export.image.toDrive({
+  image: slopeOk.byte().rename('slope_le30'),
+  description: 'Slope_Domain_LE30',
+  region: roi.geometry(), scale: 30, maxPixels: 1e13, fileFormat: 'GeoTIFF'
+});
+
+// ============================================================================
+// ============================================================================
+// 17. PATCH-LEVEL CANDIDATES FOR §2.8 MATCHING + DiD (offline)
+// ============================================================================
+
+// --- 17a. Vectorize treatment and control patches ---
+// Connected components at analysis scale (e.g. 30–100 m)
+var scalePatch = 30;
+
+var treatedPatches = treated.selfMask().connectedComponents({
+  connectedness: ee.Kernel.plus(1),
+  maxSize: 1024
+}).select('labels').rename('patch_id');
+
+var controlPatches = control.selfMask().connectedComponents({
+  connectedness: ee.Kernel.plus(1),
+  maxSize: 1024
+}).select('labels').rename('patch_id');
+
+// Convert to polygons (candidates)
+var treatedVectors = treatedPatches.reduceToVectors({
+  geometry: roi.geometry(),
+  scale: scalePatch,
+  geometryType: 'polygon',
+  eightConnected: false,
+  labelProperty: 'patch_id',
+  maxPixels: 1e13,
+  tileScale: 4
+}).map(function(f) {
+  return f.set('treated', 1).set('control', 0);
+});
+
+var controlVectors = controlPatches.reduceToVectors({
+  geometry: roi.geometry(),
+  scale: scalePatch,
+  geometryType: 'polygon',
+  eightConnected: false,
+  labelProperty: 'patch_id',
+  maxPixels: 1e13,
+  tileScale: 4
+}).map(function(f) {
+  return f.set('treated', 0).set('control', 1);
+});
+
+// Optional size filter (drop tiny fragments)
+var minAreaM2 = 5000; // tune to your expansion definition
+treatedVectors = treatedVectors.filter(ee.Filter.gte('count', 1)); // count from reduceToVectors if present
+// Prefer geometry area:
+treatedVectors = treatedVectors.map(function(f) {
+  return f.set('area_m2', f.geometry().area(1));
+}).filter(ee.Filter.gte('area_m2', minAreaM2));
+
+controlVectors = controlVectors.map(function(f) {
+  return f.set('area_m2', f.geometry().area(1));
+}).filter(ee.Filter.gte('area_m2', minAreaM2));
+
+print('Treatment patch candidates:', treatedVectors.size());
+print('Control patch candidates:', controlVectors.size());
+
+// --- 17b. Baseline land-cover ORIGIN (exact match variable) ---
+// Use baseline_cropland: 1 = cropland, 0 = rangeland (grass/scrub)
+// Manuscript should say "baseline land-cover origin", not "baseline forest status"
+
+// --- 17c. Pre-intervention AGC proxy (from 2019 AGB map or earliest available) ---
+// If true pre-2019 AGB is unavailable, use 2019 as first post baseline with care in text
+var preAGC = agb2019.multiply(0.47).rename('pre_agc'); // AGC ≈ 0.47 × AGB; adjust factor if your paper uses another
+
+// --- 17d. Environmental covariates (ERA5 / similar) ---
+// Precipitation, PET — example using ERA5-Land monthly; adjust product to your paper
+var era5 = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR')
+  .filterBounds(roi)
+  .filterDate('2016-01-01', '2019-01-01');
+
+var baselinePrecip = era5.select('total_precipitation_sum').mean().rename('precip');
+var baselineTemp = era5.select('temperature_2m').mean().rename('temp_k');
+// PET: if not in ERA5-Land directly, use a PET product you already cite, e.g.:
+// var pet = ee.ImageCollection('MODIS/006/MOD16A2').filterDate(...).select('PET').mean();
+
+// Root-zone soil moisture example (SMAP or ERA5 volumetric)
+var baselineRZSM = era5.select('volumetric_soil_water_layer_1').mean().rename('rzsm');
+
+// Elevation / slope already defined
+var elevBand = dem.rename('elevation');
+var slopeBand = slope.rename('slope');
+
+// Accessibility example: distance to roads (replace with your asset if available)
+// var roads = ee.FeatureCollection('path/to/roads');
+// var distRoads = roads.distance(1000).rename('dist_road');
+
+// --- 17e. 0.5° climate grid ID for clustering ---
+var climateGrid = ee.Image.pixelLonLat()
+  .expression('floor((lon + 180) / 0.5) * 10000 + floor((lat + 90) / 0.5)', {
+    lon: ee.Image.pixelLonLat().select('longitude'),
+    lat: ee.Image.pixelLonLat().select('latitude')
+  })
+  .toInt().rename('climate_grid_id');
+
+// --- 17f. Stack of matching + DiD covariates (NO NDVI in primary DiD) ---
+var covStack = preAGC
+  .addBands(isCropland)           // exact match: baseline land-cover origin
+  .addBands(elevBand)
+  .addBands(slopeBand)
+  .addBands(baselinePrecip)
+  .addBands(baselineRZSM)
+  .addBands(baselineTemp)
+  .addBands(climateGrid)
+  .addBands(slopeOk.rename('slope_domain')); // 1 if ≤30°
+
+// --- 17g. Reduce covariates to each patch ---
+function attachCovariates(fc) {
+  return covStack.reduceRegions({
+    collection: fc,
+    reducer: ee.Reducer.mean(),
+    scale: scalePatch,
+    tileScale: 4
+  }).map(function(f) {
+    var cen = f.geometry().centroid(1);
+    return f.set({
+      lon: cen.coordinates().get(0),
+      lat: cen.coordinates().get(1)
+    });
+  });
+}
+
+var treatedCandidates = attachCovariates(treatedVectors);
+var controlCandidates = attachCovariates(controlVectors);
+
+// Restrict primary carbon sample to GEDI domain (Issue 6)
+treatedCandidates = treatedCandidates.filter(ee.Filter.eq('slope_domain', 1));
+controlCandidates = controlCandidates.filter(ee.Filter.eq('slope_domain', 1));
+
+print('Treated candidates (slope ≤30°):', treatedCandidates.size());
+print('Control candidates (slope ≤30°):', controlCandidates.size());
+
+// Baseline origin composition (for Supplementary table)
+print('Treated mean baseline_cropland:',
+  treatedCandidates.aggregate_mean('baseline_cropland'));
+print('Control mean baseline_cropland:',
+  controlCandidates.aggregate_mean('baseline_cropland'));
+
+Export.table.toDrive({
+  collection: treatedCandidates,
+  description: 'DiD_Treatment_Patch_Candidates',
+  fileFormat: 'CSV'
+});
+Export.table.toDrive({
+  collection: controlCandidates,
+  description: 'DiD_Control_Patch_Candidates',
+  fileFormat: 'CSV'
+});
+
+// --- 17h. Optional: multi-year patch AGC panel AFTER matching (IDs from R) ---
+// After R matching, upload matched patch IDs as an asset and extract yearly AGC.
+// Example placeholder:
+// var matchedPatches = ee.FeatureCollection('projects/ee-yosef369/assets/matched_patches_328');
+// Then sampleRegions yearly AGB*0.47 for TWFE-DiD in R.
+
+// Yearly AGC at candidate patches (for event study / DiD once matched)
+var patchYearPanel = years.map(function(y) {
+  y = ee.Number(y);
+  var agb = agbMaps.filter(ee.Filter.eq('year', y)).first();
+  var agc = agb.multiply(0.47).rename('AGC'); // same carbon fraction as paper
+  var both = treatedCandidates.merge(controlCandidates);
+  return agc.reduceRegions({
+    collection: both,
+    reducer: ee.Reducer.mean(),
+    scale: scalePatch,
+    tileScale: 4
+  }).map(function(f) {
+    return f.set({
+      year: y,
+      post: y.gte(2019) ? 1 : 0,
+      event_time: y.subtract(2019)
+    });
+  });
+});
+var patchPanel = ee.FeatureCollection(patchYearPanel).flatten();
+
+Export.table.toDrive({
+  collection: patchPanel,
+  description: 'DiD_Patch_Year_AGC_Panel_unmatched',
+  fileFormat: 'CSV'
+});
+// ============================================================================
+// 18. 2025 FIELD-PLOT RF VALIDATION EXPORT
+// ============================================================================
+var plots = ee.FeatureCollection(
+  'projects/ee-yosef369/assets/field_plots_20x20m_RSE'
+);
+print('Available plot count:', plots.size());
+
+var start2025 = ee.Date('2025-01-01');
+var end2025 = ee.Date('2026-01-01');
+
+var s2Composite2025 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(roi)
+  .filterDate(start2025, end2025)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .map(addS2Indices)
+  .median();
+
+var s1Composite2025 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(roi)
+  .filterDate(start2025, end2025)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .select(['VV', 'VH'])
+  .median();
+
+var vv2025 = s1Composite2025.select('VV');
+var vh2025 = s1Composite2025.select('VH');
+var vv_vh2025 = vv2025.divide(vh2025).rename('VV_VH');
+
+var predictors2025 = s2Composite2025.select(['NDVI', 'EVI'])
+  .addBands(vv2025)
+  .addBands(vh2025)
+  .addBands(vv_vh2025)
+  .select(predictors)
+  .clip(roi);
+
+var agb2025 = predictors2025.classify(trainedRF).rename('rf_agb_pred');
+Map.addLayer(agb2025, {min: 0, max: 300, palette: ['yellow', 'green', 'darkgreen']},
+  'RF-predicted AGB 2025', false);
+
+var plotCentres = plots.map(function(f) {
+  return ee.Feature(f.geometry().centroid(1)).copyProperties(f, ['plot_id']);
+});
+
+var rfAtPlots = agb2025.reduceRegions({
+  collection: plotCentres,
+  reducer: ee.Reducer.first(),
+  scale: 25,
+  tileScale: 4
+});
+
+var rfExport = rfAtPlots
+  .filter(ee.Filter.notNull(['rf_agb_pred']))
+  .map(function(f) {
+    return ee.Feature(null, {
+      plot_id: f.get('plot_id'),
+      rf_agb_pred: f.get('rf_agb_pred')
+    });
+  });
+print('Plots with RF predictions:', rfExport.size());
+
+Export.table.toDrive({
+  collection: rfExport,
+  description: 'RF_AGB_2025_at_Field_Plots',
+  fileFormat: 'CSV',
+  selectors: ['plot_id', 'rf_agb_pred']
+});
+
+Export.table.toDrive({
+  collection: training,
+  description: 'RF_AGB_Training_Table',
+  fileFormat: 'CSV'
+});
+
+print('=======================================');
+print('Script completed.');
+print('Table 2.2 cascade includes night-time.');
+print('Matching uses baseline_cropland (not forest status).');
+print('Primary carbon stats restricted to slope ≤30°.');
+print('Check Tasks tab for exports.');
+print('=======================================');
