@@ -1,0 +1,2785 @@
+// ============================================================================
+// PERSISTENT WOODY-COVER EXPANSION AND TRANSITION ANALYSIS
+// Bale Mountains Eco-Region (BMER), Ethiopia
+// 2019–2025
+//
+// VERSION: Corrected transition logic + diagnostic CSV exports
+//
+// SCIENTIFIC PURPOSE
+// ------------------
+// Identify persistent woody-cover expansion using:
+//   1. Dynamic World annual tree probability
+//   2. 2019 baseline non-woody condition
+//   3. Multi-year persistence
+//   4. Sentinel-2 spectral confirmation
+//   5. Ecologically explicit class crosswalk
+//   6. Water/flooded/built/snow exclusion
+//   7. Minimum mapping unit
+//   8. Transition-specific validation sampling
+//   9. Elevation/slope availability analysis
+//
+// IMPORTANT
+// ---------
+// This analysis identifies persistent woody-cover expansion during 2019–2025.
+// It DOES NOT attribute expansion causally to the Green Legacy Initiative (GLI).
+//
+// GLI planting polygons are intentionally NOT used in this version.
+//
+// Principal transition classes:
+//   0 = masked / excluded / undefined
+//   1 = stable non-forest
+//   2 = persistent woody expansion
+//   3 = woody-cover loss
+//   4 = stable woody
+//   5 = uncertain transition
+//
+// Origin-specific expansion diagnostics:
+//   open-land -> woody
+//   cropland  -> woody
+//
+// Transition accuracy and area-adjusted 95% confidence intervals require
+// independent multi-date reference interpretation of the exported validation
+// sample. This script creates the reference-sample frame but does not invent
+// reference labels.
+// ============================================================================
+
+
+// ============================================================================
+// 0. STUDY AREA AND PARAMETERS
+// ============================================================================
+
+var studyArea = ee.FeatureCollection(
+  'projects/ee-yosef369/assets/Study_area'
+);
+
+var roi = studyArea.geometry();
+
+Map.centerObject(roi, 8);
+
+
+// --------------------------------------------------------------------------
+// Study period
+// --------------------------------------------------------------------------
+
+var startYear = 2019;
+var endYear   = 2025;
+
+var years = ee.List.sequence(startYear, endYear);
+
+
+// --------------------------------------------------------------------------
+// Seasonal compositing window
+// --------------------------------------------------------------------------
+
+var startMonth = 9;
+var endMonth   = 10;
+
+
+// --------------------------------------------------------------------------
+// Dynamic World thresholds
+//
+// Baseline:
+//   tree probability < 0.20 = baseline non-woody
+//
+// Woody:
+//   tree probability >= 0.30 = woody condition
+//
+// Sensitivity:
+//   3 consecutive years = primary persistence criterion
+//   2 years             = sensitivity analysis
+// --------------------------------------------------------------------------
+
+var baselineTreeThreshold = 0.20;
+
+var woodyProbabilityThreshold = 0.30;
+
+var minimumConsecutiveYears = 3;
+
+var sensitivityConsecutiveYears = 2;
+
+
+// --------------------------------------------------------------------------
+// Sentinel-2 confirmation
+// --------------------------------------------------------------------------
+
+var minNDVIIncrease = 0.05;
+
+var minNDMIChange = 0.00;
+
+
+// --------------------------------------------------------------------------
+// Minimum mapping unit
+//
+// At 10 m:
+//   1 pixel = 100 m2 = 0.01 ha
+//   50 pixels = 0.50 ha
+// --------------------------------------------------------------------------
+
+var minimumMappingUnitHa = 0.50;
+
+var minimumPixels = 50;
+
+var mappingScale = 10;
+
+
+// --------------------------------------------------------------------------
+// Summary scale
+//
+// Used for regional area summaries to reduce computation.
+// The exported transition map remains at 10 m.
+// --------------------------------------------------------------------------
+
+var summaryScale = 30;
+
+
+// --------------------------------------------------------------------------
+// Validation sample size
+// --------------------------------------------------------------------------
+
+var validationPointsPerClass = 100;
+
+
+// ============================================================================
+// 1. SENTINEL-2 CLOUD MASK
+// ============================================================================
+
+function maskS2(image) {
+
+  var scl = image.select('SCL');
+
+  var mask = scl.neq(3)    // cloud shadow
+    .and(scl.neq(8))        // medium probability cloud
+    .and(scl.neq(9))        // high probability cloud
+    .and(scl.neq(10))       // cirrus
+    .and(scl.neq(11));      // snow/ice
+
+  return image
+    .updateMask(mask)
+    .divide(10000)
+    .copyProperties(image, ['system:time_start']);
+}
+
+
+// ============================================================================
+// 2. SENTINEL-2 SPECTRAL INDICES
+// ============================================================================
+//
+// NDVI: standard vegetation index
+// NDMI: moisture-related vegetation index
+// NBR : vegetation/burn/disturbance-sensitive index
+// EVI : canopy-sensitive vegetation index
+// SAVI: soil-adjusted vegetation index
+//
+// SAVI constant L = 0.5
+// ============================================================================
+
+function addS2Indices(image) {
+
+  var ndvi = image
+    .normalizedDifference(['B8', 'B4'])
+    .rename('NDVI');
+
+  var ndmi = image
+    .normalizedDifference(['B8', 'B11'])
+    .rename('NDMI');
+
+  var nbr = image
+    .normalizedDifference(['B8', 'B12'])
+    .rename('NBR');
+
+  var evi = image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))',
+    {
+      NIR: image.select('B8'),
+      RED: image.select('B4'),
+      BLUE: image.select('B2')
+    }
+  ).rename('EVI');
+
+  var savi = image.expression(
+    '1.5 * ((NIR - RED) / (NIR + RED + 0.5))',
+    {
+      NIR: image.select('B8'),
+      RED: image.select('B4')
+    }
+  ).rename('SAVI');
+
+  return image.addBands([
+    ndvi,
+    ndmi,
+    nbr,
+    evi,
+    savi
+  ]);
+}
+
+
+// ============================================================================
+// 3. ANNUAL SENTINEL-2 COMPOSITES
+// ============================================================================
+
+function getS2Composite(year) {
+
+  year = ee.Number(year);
+
+  var startDate = ee.Date.fromYMD(
+    year,
+    startMonth,
+    1
+  );
+
+  var endDate = ee.Date.fromYMD(
+    year,
+    11,
+    1
+  );
+
+  var collection = ee.ImageCollection(
+    'COPERNICUS/S2_SR_HARMONIZED'
+  )
+  .filterBounds(roi)
+  .filterDate(startDate, endDate)
+  .filter(
+    ee.Filter.lt(
+      'CLOUDY_PIXEL_PERCENTAGE',
+      60
+    )
+  )
+  .map(maskS2)
+  .map(addS2Indices);
+
+  return collection
+    .median()
+    .clip(roi)
+    .set('year', year)
+    .set('image_count', collection.size());
+}
+
+
+var annualS2 = ee.ImageCollection.fromImages(
+  years.map(function(year) {
+    return getS2Composite(year);
+  })
+);
+
+print(
+  'Sentinel-2 image count by year',
+  annualS2.aggregate_array('image_count')
+);
+
+
+// ============================================================================
+// 4. ANNUAL DYNAMIC WORLD TREE PROBABILITY
+// ============================================================================
+//
+// Dynamic World "trees" is a probability band, not a categorical label.
+// This probability trajectory is the principal temporal signal.
+// ============================================================================
+
+function getDWTreeComposite(year) {
+
+  year = ee.Number(year);
+
+  var startDate = ee.Date.fromYMD(
+    year,
+    startMonth,
+    1
+  );
+
+  var endDate = ee.Date.fromYMD(
+    year,
+    11,
+    1
+  );
+
+  var collection = ee.ImageCollection(
+    'GOOGLE/DYNAMICWORLD/V1'
+  )
+  .filterBounds(roi)
+  .filterDate(startDate, endDate)
+  .select('trees');
+
+  return collection
+    .median()
+    .rename('tree_probability')
+    .clip(roi)
+    .set('year', year)
+    .set('image_count', collection.size());
+}
+
+
+var annualDW = ee.ImageCollection.fromImages(
+  years.map(function(year) {
+    return getDWTreeComposite(year);
+  })
+);
+
+print(
+  'Dynamic World image count by year',
+  annualDW.aggregate_array('image_count')
+);
+
+
+// ============================================================================
+// 5. ANNUAL DYNAMIC WORLD IMAGES
+// ============================================================================
+
+function getDWYear(year) {
+
+  return ee.Image(
+    annualDW
+      .filter(
+        ee.Filter.eq('year', year)
+      )
+      .first()
+  );
+}
+
+
+var dw2019 = getDWYear(2019);
+var dw2020 = getDWYear(2020);
+var dw2021 = getDWYear(2021);
+var dw2022 = getDWYear(2022);
+var dw2023 = getDWYear(2023);
+var dw2024 = getDWYear(2024);
+var dw2025 = getDWYear(2025);
+
+
+// ============================================================================
+// 6. BASELINE CONDITION
+// ============================================================================
+//
+// 2019 is the baseline year.
+//
+// baselineNonWoody:
+//   tree probability < 0.20
+//
+// Pixels between 0.20 and 0.30 are intentionally not treated as baseline
+// non-woody because they are transition/ambiguous probability values.
+// ============================================================================
+
+var baselineNonWoody = dw2019
+  .lt(baselineTreeThreshold)
+  .rename('baseline_nonwoody');
+
+
+// ============================================================================
+// 7. ANNUAL WOODY CONDITIONS
+// ============================================================================
+
+var woody2019 = dw2019
+  .gte(woodyProbabilityThreshold)
+  .rename('woody_2019');
+
+var woody2020 = dw2020
+  .gte(woodyProbabilityThreshold)
+  .rename('woody_2020');
+
+var woody2021 = dw2021
+  .gte(woodyProbabilityThreshold)
+  .rename('woody_2021');
+
+var woody2022 = dw2022
+  .gte(woodyProbabilityThreshold)
+  .rename('woody_2022');
+
+var woody2023 = dw2023
+  .gte(woodyProbabilityThreshold)
+  .rename('woody_2023');
+
+var woody2024 = dw2024
+  .gte(woodyProbabilityThreshold)
+  .rename('woody_2024');
+
+var woody2025 = dw2025
+  .gte(woodyProbabilityThreshold)
+  .rename('woody_2025');
+
+
+// ============================================================================
+// 8. THREE-CONSECUTIVE-YEAR PERSISTENCE
+// ============================================================================
+//
+// Primary persistence rule:
+//
+// At least one 3-year consecutive window satisfies:
+// tree probability >= 0.30 in all three years.
+//
+// Windows:
+//
+// 2019–2021
+// 2020–2022
+// 2021–2023
+// 2022–2024
+// 2023–2025
+// ============================================================================
+
+var consecutive2019_2021 =
+  woody2019
+    .and(woody2020)
+    .and(woody2021);
+
+var consecutive2020_2022 =
+  woody2020
+    .and(woody2021)
+    .and(woody2022);
+
+var consecutive2021_2023 =
+  woody2021
+    .and(woody2022)
+    .and(woody2023);
+
+var consecutive2022_2024 =
+  woody2022
+    .and(woody2023)
+    .and(woody2024);
+
+var consecutive2023_2025 =
+  woody2023
+    .and(woody2024)
+    .and(woody2025);
+
+
+var persistentThreeYear =
+  consecutive2019_2021
+    .or(consecutive2020_2022)
+    .or(consecutive2021_2023)
+    .or(consecutive2022_2024)
+    .or(consecutive2023_2025)
+    .rename('persistent_three_year');
+
+
+// ============================================================================
+// 9. TWO-YEAR SENSITIVITY RULE
+// ============================================================================
+//
+// This is NOT the primary estimate.
+// It is retained to test sensitivity of mapped expansion to persistence
+// duration.
+// ============================================================================
+
+var consecutive2019_2020 =
+  woody2019.and(woody2020);
+
+var consecutive2020_2021 =
+  woody2020.and(woody2021);
+
+var consecutive2021_2022 =
+  woody2021.and(woody2022);
+
+var consecutive2022_2023 =
+  woody2022.and(woody2023);
+
+var consecutive2023_2024 =
+  woody2023.and(woody2024);
+
+var consecutive2024_2025 =
+  woody2024.and(woody2025);
+
+
+var persistentTwoYear =
+  consecutive2019_2020
+    .or(consecutive2020_2021)
+    .or(consecutive2021_2022)
+    .or(consecutive2022_2023)
+    .or(consecutive2023_2024)
+    .or(consecutive2024_2025)
+    .rename('persistent_two_year');
+
+
+// ============================================================================
+// 10. SENTINEL-2 2019 AND 2025
+// ============================================================================
+
+var s2_2019 = ee.Image(
+  annualS2
+    .filter(
+      ee.Filter.eq('year', 2019)
+    )
+    .first()
+);
+
+var s2_2025 = ee.Image(
+  annualS2
+    .filter(
+      ee.Filter.eq('year', 2025)
+    )
+    .first()
+);
+
+
+// ============================================================================
+// 11. SENTINEL-2 CHANGE
+// ============================================================================
+
+var ndviChange = s2_2025
+  .select('NDVI')
+  .subtract(
+    s2_2019.select('NDVI')
+  )
+  .rename('NDVI_change');
+
+var ndmiChange = s2_2025
+  .select('NDMI')
+  .subtract(
+    s2_2019.select('NDMI')
+  )
+  .rename('NDMI_change');
+
+
+// ============================================================================
+// 12. SENTINEL-2 CONFIRMATION
+// ============================================================================
+//
+// Confirmation requires:
+//
+// NDVI increase >= 0.05
+// AND
+// NDMI change >= 0
+//
+// This is used as supporting spectral evidence, not as an independent
+// land-cover classification.
+// ============================================================================
+
+var s2Confirmation =
+  ndviChange
+    .gte(minNDVIIncrease)
+    .and(
+      ndmiChange.gte(minNDMIChange)
+    )
+    .rename('S2_confirmation');
+
+
+// ============================================================================
+// 13. DYNAMIC WORLD CATEGORICAL LABELS
+// ============================================================================
+//
+// Dynamic World labels:
+//
+// 0 = water
+// 1 = trees
+// 2 = grass
+// 3 = flooded vegetation
+// 4 = crops
+// 5 = shrub and scrub
+// 6 = built
+// 7 = bare
+// 8 = snow and ice
+// ============================================================================
+
+function getDWLabel(year) {
+
+  var startDate = ee.Date.fromYMD(
+    year,
+    startMonth,
+    1
+  );
+
+  var endDate = ee.Date.fromYMD(
+    year,
+    11,
+    1
+  );
+
+  var col = ee.ImageCollection(
+    'GOOGLE/DYNAMICWORLD/V1'
+  )
+  .filterBounds(roi)
+  .filterDate(startDate, endDate)
+  .select('label');
+
+  return ee.Image(
+    ee.Algorithms.If(
+      col.size().gt(0),
+      col.mode().clip(roi),
+      ee.Image(0).clip(roi)
+    )
+  )
+  .rename('dw_label_' + year);
+}
+
+
+var dwLabel2019 = getDWLabel(2019);
+
+var dwLabel2025 = getDWLabel(2025);
+
+
+// ============================================================================
+// 14. ECOLOGICAL CLASS CROSSWALK
+// ============================================================================
+//
+// "Non-forest open land" includes:
+//   grass
+//   shrub/scrub
+//   bare
+//
+// Cropland is retained separately because conversion from cropland to woody
+// cover has a different ecological interpretation.
+//
+// Water, flooded vegetation, built and snow/ice are excluded.
+//
+// This avoids calling all non-forest land "rangeland".
+// ============================================================================
+
+var openLand2019 =
+  dwLabel2019.eq(2)
+    .or(dwLabel2019.eq(5))
+    .or(dwLabel2019.eq(7));
+
+var openLand2025 =
+  dwLabel2025.eq(2)
+    .or(dwLabel2025.eq(5))
+    .or(dwLabel2025.eq(7));
+
+
+var crop2019 =
+  dwLabel2019.eq(4);
+
+var crop2025 =
+  dwLabel2025.eq(4);
+
+
+// ============================================================================
+// 15. EXCLUSION MASK
+// ============================================================================
+
+var water2019 =
+  dwLabel2019.eq(0);
+
+var water2025 =
+  dwLabel2025.eq(0);
+
+var flooded2019 =
+  dwLabel2019.eq(3);
+
+var flooded2025 =
+  dwLabel2025.eq(3);
+
+var built2019 =
+  dwLabel2019.eq(6);
+
+var built2025 =
+  dwLabel2025.eq(6);
+
+var snow2019 =
+  dwLabel2019.eq(8);
+
+var snow2025 =
+  dwLabel2025.eq(8);
+
+
+var exclusionMask =
+  water2019
+    .or(water2025)
+    .or(flooded2019)
+    .or(flooded2025)
+    .or(built2019)
+    .or(built2025)
+    .or(snow2019)
+    .or(snow2025);
+
+
+// ============================================================================
+// 16. RAW PERSISTENT EXPANSION
+// ============================================================================
+//
+// Conditions:
+//
+// 1. Baseline non-woody
+// 2. Three-year persistent woody condition
+// 3. Sentinel-2 confirmation
+// 4. No excluded land-cover class
+// ============================================================================
+
+var rawExpansion =
+  baselineNonWoody
+    .and(persistentThreeYear)
+    .and(s2Confirmation)
+    .and(exclusionMask.not())
+    .rename('raw_persistent_expansion');
+
+
+// ============================================================================
+// 17. MINIMUM MAPPING UNIT
+// ============================================================================
+//
+// 0.5 ha = 50 pixels at 10 m.
+//
+// 8-connected neighborhood is used.
+// ============================================================================
+
+var patchSize =
+  rawExpansion
+    .selfMask()
+    .connectedPixelCount(
+      minimumPixels,
+      true
+    );
+
+
+var persistentExpansion =
+  rawExpansion
+    .and(
+      patchSize.gte(minimumPixels)
+    )
+    .rename('persistent_expansion');
+
+
+// ============================================================================
+// 18. FINAL WOODY STATUS
+// ============================================================================
+
+var finalWoody =
+  dw2025
+    .gte(woodyProbabilityThreshold)
+    .rename('final_woody');
+
+
+// ============================================================================
+// 19. ORIGIN-SPECIFIC EXPANSION DIAGNOSTICS
+// ============================================================================
+//
+// These are NOT separate principal transition classes.
+//
+// They are exported separately so the analysis can distinguish:
+//
+//   non-forest open land -> woody
+//   cropland -> woody
+// ============================================================================
+
+var openLandExpansion =
+  persistentExpansion
+    .and(openLand2019)
+    .rename('open_land_to_woody');
+
+var cropExpansion =
+  persistentExpansion
+    .and(crop2019)
+    .rename('cropland_to_woody');
+
+
+// ============================================================================
+// 20. WOODY LOSS
+// ============================================================================
+//
+// Baseline woody -> final non-woody.
+//
+// Excluded classes are removed.
+// ============================================================================
+
+var woodyLoss =
+  woody2019
+    .and(finalWoody.not())
+    .and(exclusionMask.not())
+    .rename('woody_loss');
+
+
+// ============================================================================
+// 21. STABLE WOODY
+// ============================================================================
+
+var stableWoody =
+  woody2019
+    .and(finalWoody)
+    .and(exclusionMask.not())
+    .rename('stable_woody');
+
+
+// ============================================================================
+// 22. STABLE NON-FOREST
+// ============================================================================
+//
+// Baseline non-woody and final non-woody,
+// excluding persistent expansion.
+// ============================================================================
+
+var stableNonForest =
+  baselineNonWoody
+    .and(finalWoody.not())
+    .and(exclusionMask.not())
+    .and(persistentExpansion.not())
+    .rename('stable_nonforest');
+
+
+// ============================================================================
+// 23. UNCERTAIN TRANSITIONS
+// ============================================================================
+//
+// Pixels within the valid analysis domain that cannot be confidently assigned
+// to one of the four principal classes.
+//
+// This is deliberately NOT a catch-all for the entire landscape.
+//
+// The uncertain class is restricted to:
+//   baseline transition-probability zone
+//   or final transition-probability zone
+//   or other ambiguous valid cases.
+//
+// Excluded pixels remain masked (0), not uncertain.
+// ============================================================================
+
+var baselineAmbiguous =
+  dw2019
+    .gte(baselineTreeThreshold)
+    .and(
+      dw2019.lt(woodyProbabilityThreshold)
+    );
+
+var finalAmbiguous =
+  dw2025
+    .gte(baselineTreeThreshold)
+    .and(
+      dw2025.lt(woodyProbabilityThreshold)
+    );
+
+var assignedPrincipal =
+  stableNonForest
+    .or(persistentExpansion)
+    .or(woodyLoss)
+    .or(stableWoody);
+
+
+var uncertainTransition =
+  baselineAmbiguous
+    .or(finalAmbiguous)
+    .and(exclusionMask.not())
+    .and(assignedPrincipal.not())
+    .rename('uncertain_transition');
+
+
+// ============================================================================
+// 24. FINAL TRANSITION MAP
+// ============================================================================
+//
+// 0 = masked / excluded / outside valid transition domain
+// 1 = stable non-forest
+// 2 = persistent woody expansion
+// 3 = woody-cover loss
+// 4 = stable woody
+// 5 = uncertain transition
+//
+// IMPORTANT:
+// There is NO artificial class 6.
+// ============================================================================
+
+var transition = ee.Image(0)
+  .where(
+    stableNonForest,
+    1
+  )
+  .where(
+    persistentExpansion,
+    2
+  )
+  .where(
+    woodyLoss,
+    3
+  )
+  .where(
+    stableWoody,
+    4
+  )
+  .where(
+    uncertainTransition,
+    5
+  )
+  .rename('transition')
+  .toByte()
+  .clip(roi);
+
+
+// Mask class 0 for display and analysis.
+
+var transitionMasked =
+  transition
+    .updateMask(
+      transition.gt(0)
+    );
+
+
+// ============================================================================
+// 25. TRANSITION CLASS CROSSWALK
+// ============================================================================
+
+var transitionCrosswalk =
+  ee.FeatureCollection([
+
+    ee.Feature(null, {
+      map_class: 1,
+      class_name: 'stable_nonforest',
+      interpretation:
+        'Baseline non-woody and final non-woody with no persistent woody expansion'
+    }),
+
+    ee.Feature(null, {
+      map_class: 2,
+      class_name: 'persistent_woody_expansion',
+      interpretation:
+        'Baseline non-woody followed by persistent woody establishment'
+    }),
+
+    ee.Feature(null, {
+      map_class: 3,
+      class_name: 'woody_loss',
+      interpretation:
+        'Baseline woody condition followed by final non-woody condition'
+    }),
+
+    ee.Feature(null, {
+      map_class: 4,
+      class_name: 'stable_woody',
+      interpretation:
+        'Woody condition in both 2019 and 2025'
+    }),
+
+    ee.Feature(null, {
+      map_class: 5,
+      class_name: 'uncertain_transition',
+      interpretation:
+        'Ambiguous probability trajectory not confidently assigned to a principal transition'
+    })
+  ]);
+
+
+// ============================================================================
+// 26. MAP DISPLAY
+// ============================================================================
+
+Map.addLayer(
+  dw2019,
+  {
+    min: 0,
+    max: 1,
+    palette: [
+      'white',
+      'yellow',
+      'green',
+      'darkgreen'
+    ]
+  },
+  'DW Tree Probability 2019',
+  false
+);
+
+
+Map.addLayer(
+  dw2025,
+  {
+    min: 0,
+    max: 1,
+    palette: [
+      'white',
+      'yellow',
+      'green',
+      'darkgreen'
+    ]
+  },
+  'DW Tree Probability 2025',
+  false
+);
+
+
+Map.addLayer(
+  ndviChange,
+  {
+    min: -0.3,
+    max: 0.3,
+    palette: [
+      'brown',
+      'white',
+      'green'
+    ]
+  },
+  'Sentinel-2 NDVI Change 2019–2025',
+  false
+);
+
+
+Map.addLayer(
+  persistentExpansion.selfMask(),
+  {
+    palette: ['red']
+  },
+  'Persistent Woody Expansion 2019–2025'
+);
+
+
+Map.addLayer(
+  openLandExpansion.selfMask(),
+  {
+    palette: ['orange']
+  },
+  'Open-land → Woody Expansion',
+  false
+);
+
+
+Map.addLayer(
+  cropExpansion.selfMask(),
+  {
+    palette: ['purple']
+  },
+  'Cropland → Woody Expansion',
+  false
+);
+
+
+Map.addLayer(
+  woodyLoss.selfMask(),
+  {
+    palette: ['blue']
+  },
+  'Woody Loss',
+  false
+);
+
+
+// --------------------------------------------------------------------------
+// IMPORTANT: max = 5, NOT 6
+// --------------------------------------------------------------------------
+
+Map.addLayer(
+  transitionMasked,
+  {
+    min: 1,
+    max: 5,
+    palette: [
+      'yellow',    // 1 stable nonforest
+      'red',       // 2 persistent expansion
+      'blue',      // 3 woody loss
+      'darkgreen', // 4 stable woody
+      'gray'       // 5 uncertain
+    ]
+  },
+  'Woody Transition 2019–2025'
+);
+
+// Export Woody Transition 2019–2025
+Export.image.toDrive({
+  image: transitionMasked,
+  description: 'Woody_Transition_2019_2025_BMER',
+  folder: 'BMER_Woody_Transition',
+  fileNamePrefix: 'Woody_Transition_2019_2025_BMER',
+  region: roi,
+  scale: 10,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+// ============================================================================
+// 27. DEM, ELEVATION AND SLOPE
+// ============================================================================
+
+var dem =
+  ee.Image('USGS/SRTMGL1_003')
+    .select('elevation')
+    .clip(roi);
+
+var elevation =
+  dem.rename('elevation');
+
+var slope =
+  ee.Terrain
+    .slope(dem)
+    .rename('slope');
+
+
+// --------------------------------------------------------------------------
+// Elevation classes
+//
+// 1 = <1500 m
+// 2 = 1500–2500 m
+// 3 = >=2500 m
+// --------------------------------------------------------------------------
+
+var elevationClass =
+  ee.Image(0)
+    .where(
+      elevation.lt(1500),
+      1
+    )
+    .where(
+      elevation.gte(1500)
+        .and(elevation.lt(2500)),
+      2
+    )
+    .where(
+      elevation.gte(2500),
+      3
+    )
+    .rename('elevation_class');
+
+
+// --------------------------------------------------------------------------
+// Slope classes
+//
+// 1 = <5°
+// 2 = 5–15°
+// 3 = 15–30°
+// 4 = >=30°
+// --------------------------------------------------------------------------
+
+var slopeClass =
+  ee.Image(0)
+    .where(
+      slope.lt(5),
+      1
+    )
+    .where(
+      slope.gte(5)
+        .and(slope.lt(15)),
+      2
+    )
+    .where(
+      slope.gte(15)
+        .and(slope.lt(30)),
+      3
+    )
+    .where(
+      slope.gte(30),
+      4
+    )
+    .rename('slope_class');
+
+
+// ============================================================================
+// 28. PIXEL AREA
+// ============================================================================
+
+var pixelAreaHa =
+  ee.Image.pixelArea()
+    .divide(10000)
+    .rename('area_ha');
+
+
+// ============================================================================
+// 29. AREA FUNCTION
+// ============================================================================
+
+function areaForMask(mask) {
+
+  return pixelAreaHa
+    .updateMask(mask)
+    .reduceRegion({
+
+      reducer:
+        ee.Reducer.sum(),
+
+      geometry:
+        roi,
+
+      scale:
+        summaryScale,
+
+      maxPixels:
+        1e9,
+
+      bestEffort:
+        true,
+
+      tileScale:
+        16
+
+    })
+    .get('area_ha');
+}
+
+
+// ============================================================================
+// 30. TOTAL AREAS
+// ============================================================================
+
+print(
+  'Persistent woody expansion area (ha)',
+  areaForMask(
+    persistentExpansion
+  )
+);
+
+print(
+  'Open-land → woody expansion area (ha)',
+  areaForMask(
+    openLandExpansion
+  )
+);
+
+print(
+  'Cropland → woody expansion area (ha)',
+  areaForMask(
+    cropExpansion
+  )
+);
+
+print(
+  'Woody loss area (ha)',
+  areaForMask(
+    woodyLoss
+  )
+);
+
+print(
+  'Stable woody area (ha)',
+  areaForMask(
+    stableWoody
+  )
+);
+
+print(
+  'Stable non-forest area (ha)',
+  areaForMask(
+    stableNonForest
+  )
+);
+
+print(
+  'Uncertain transition area (ha)',
+  areaForMask(
+    uncertainTransition
+  )
+);
+
+
+// ============================================================================
+// 30b. RECOMMENDED DIAGNOSTIC – CLASS AREA FRACTIONS
+// ============================================================================
+//
+// Shows the proportion of the ROI occupied by each class (including masked 0).
+// ============================================================================
+
+print(
+  'Transition class area fractions (0=masked, 1–5=valid classes)',
+  transition.eq(0).rename('c0')
+    .addBands(transition.eq(1).rename('c1'))
+    .addBands(transition.eq(2).rename('c2'))
+    .addBands(transition.eq(3).rename('c3'))
+    .addBands(transition.eq(4).rename('c4'))
+    .addBands(transition.eq(5).rename('c5'))
+    .reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: roi,
+      scale: 100,
+      maxPixels: 1e9,
+      bestEffort: true,
+      tileScale: 8
+    })
+);
+
+
+// ============================================================================
+// 31. MAP CLASS AREA TABLE
+// ============================================================================
+//
+// Only classes 1–5 are included.
+// Class 0 is intentionally excluded from the area table.
+// ============================================================================
+
+var mapClassValues =
+ ee.List([
+    1,
+    2,
+    3,
+    4,
+    5
+  ]);
+
+var mapClassNames =
+  ee.List([
+    'stable_nonforest',
+    'persistent_woody_expansion',
+    'woody_loss',
+    'stable_woody',
+    'uncertain_transition'
+  ]);
+
+
+var mapAreaTable =
+  ee.FeatureCollection(
+
+    mapClassValues.map(
+      function(classValue) {
+
+        classValue =
+          ee.Number(classValue);
+
+        var index =
+          mapClassValues.indexOf(
+            classValue
+          );
+
+        var className =
+          mapClassNames.get(index);
+
+        var area =
+          pixelAreaHa
+            .updateMask(
+              transition.eq(classValue)
+            )
+            .reduceRegion({
+
+              reducer:
+                ee.Reducer.sum(),
+
+              geometry:
+                roi,
+
+              scale:
+                summaryScale,
+
+              maxPixels:
+                1e9,
+
+              bestEffort:
+                true,
+
+              tileScale:
+                16
+
+            })
+            .get('area_ha');
+
+        return ee.Feature(
+          null,
+          {
+            map_class:
+              classValue,
+
+            class_name:
+              className,
+
+            map_area_ha:
+              area
+          }
+        );
+      }
+    )
+  );
+
+
+print(
+  'FINAL MAP CLASS AREAS',
+  mapAreaTable
+);
+
+
+// ============================================================================
+// 32. TWO-YEAR VS THREE-YEAR PERSISTENCE DIAGNOSTIC
+// ============================================================================
+
+var rawExpansionTwoYear =
+  baselineNonWoody
+    .and(persistentTwoYear)
+    .and(s2Confirmation)
+    .and(exclusionMask.not())
+    .rename('raw_two_year_expansion');
+
+
+var patchSizeTwoYear =
+  rawExpansionTwoYear
+    .selfMask()
+    .connectedPixelCount(
+      minimumPixels,
+      true
+    );
+
+
+var persistentExpansionTwoYear =
+  rawExpansionTwoYear
+    .and(
+      patchSizeTwoYear.gte(
+        minimumPixels
+      )
+    );
+
+
+print(
+  'Three-year persistent expansion area (ha)',
+  areaForMask(
+    persistentExpansion
+  )
+);
+
+print(
+  'Two-year sensitivity expansion area (ha)',
+  areaForMask(
+    persistentExpansionTwoYear
+  )
+);
+
+
+// ============================================================================
+// 33. ELEVATION AREA TABLE
+// ============================================================================
+//
+// Avoids the previous "Group input must come after weighted inputs" problem.
+// The grouped reducer is explicitly constructed as:
+//   sum().group(groupField, groupName)
+// with area as the first band and class as the second band.
+// ============================================================================
+
+var elevationExpansionImage =
+  pixelAreaHa
+    .addBands(
+      elevationClass
+    )
+    .updateMask(
+      persistentExpansion
+    );
+
+
+var elevationExpansionStats =
+  elevationExpansionImage
+    .reduceRegion({
+
+      reducer:
+        ee.Reducer.sum()
+          .group({
+            groupField: 1,
+            groupName: 'elevation_class'
+          }),
+
+      geometry:
+        roi,
+
+      scale:
+        summaryScale,
+
+      maxPixels:
+        1e9,
+
+      bestEffort:
+        true,
+
+      tileScale:
+        16
+
+    });
+
+
+print(
+  'Expansion area by elevation class',
+  elevationExpansionStats
+);
+
+
+// ============================================================================
+// 34. LANDSCAPE ELEVATION AREA
+// ============================================================================
+
+var landscapeElevationImage =
+  pixelAreaHa
+    .addBands(
+      elevationClass
+    );
+
+
+var landscapeElevationStats =
+  landscapeElevationImage
+    .reduceRegion({
+
+      reducer:
+        ee.Reducer.sum()
+          .group({
+            groupField: 1,
+            groupName: 'elevation_class'
+          }),
+
+      geometry:
+        roi,
+
+      scale:
+        summaryScale,
+
+      maxPixels:
+        1e9,
+
+      bestEffort:
+        true,
+
+      tileScale:
+        16
+
+    });
+
+
+print(
+  'Landscape area by elevation class',
+  landscapeElevationStats
+);
+
+
+// ============================================================================
+// 35. ELEVATION SELECTION-RATIO TABLE
+// ============================================================================
+//
+// Selection ratio:
+//
+// expansion proportion within class
+// ----------------------------------
+// landscape proportion within class
+//
+// >1 = expansion over-represented
+// <1 = expansion under-represented
+// ============================================================================
+
+var elevationSelectionTable =
+  ee.FeatureCollection(
+
+    [1, 2, 3].map(
+      function(classValue) {
+
+        classValue =
+          ee.Number(classValue);
+
+        var expansion =
+          pixelAreaHa
+            .updateMask(
+              persistentExpansion
+            )
+            .updateMask(
+              elevationClass.eq(
+                classValue
+              )
+            )
+            .reduceRegion({
+
+              reducer:
+                ee.Reducer.sum(),
+
+              geometry:
+                roi,
+
+              scale:
+                summaryScale,
+
+              maxPixels:
+                1e9,
+
+              bestEffort:
+                true,
+
+              tileScale:
+                16
+
+            })
+            .get('area_ha');
+
+
+        var landscape =
+          pixelAreaHa
+            .updateMask(
+              elevationClass.eq(
+                classValue
+              )
+            )
+            .reduceRegion({
+
+              reducer:
+                ee.Reducer.sum(),
+
+              geometry:
+                roi,
+
+              scale:
+                summaryScale,
+
+              maxPixels:
+                1e9,
+
+              bestEffort:
+                true,
+
+              tileScale:
+                16
+
+            })
+            .get('area_ha');
+
+
+        return ee.Feature(
+          null,
+          {
+            variable:
+              'elevation',
+
+            class:
+              classValue,
+
+            expansion_area_ha:
+              expansion,
+
+            landscape_area_ha:
+              landscape
+          }
+        );
+
+      }
+    )
+  );
+
+
+// ============================================================================
+// 36. SLOPE AREA TABLE
+// ============================================================================
+
+var slopeExpansionImage =
+  pixelAreaHa
+    .addBands(
+      slopeClass
+    )
+    .updateMask(
+      persistentExpansion
+    );
+
+
+var slopeExpansionStats =
+  slopeExpansionImage
+    .reduceRegion({
+
+      reducer:
+        ee.Reducer.sum()
+          .group({
+            groupField: 1,
+            groupName: 'slope_class'
+          }),
+
+      geometry:
+        roi,
+
+      scale:
+        summaryScale,
+
+      maxPixels:
+        1e9,
+
+      bestEffort:
+        true,
+
+      tileScale:
+        16
+
+    });
+
+
+print(
+  'Expansion area by slope class',
+  slopeExpansionStats
+);
+
+
+// ============================================================================
+// 37. LANDSCAPE SLOPE AREA
+// ============================================================================
+
+var landscapeSlopeImage =
+  pixelAreaHa
+    .addBands(
+      slopeClass
+    );
+
+
+var landscapeSlopeStats =
+  landscapeSlopeImage
+    .reduceRegion({
+
+      reducer:
+        ee.Reducer.sum()
+          .group({
+            groupField: 1,
+            groupName: 'slope_class'
+          }),
+
+      geometry:
+        roi,
+
+      scale:
+        summaryScale,
+
+      maxPixels:
+        1e9,
+
+      bestEffort:
+        true,
+
+      tileScale:
+        16
+
+    });
+
+
+print(
+  'Landscape area by slope class',
+  landscapeSlopeStats
+);
+
+
+// ============================================================================
+// 38. SLOPE SELECTION-RATIO TABLE
+// ============================================================================
+
+var slopeSelectionTable =
+  ee.FeatureCollection(
+
+    [1, 2, 3, 4].map(
+      function(classValue) {
+
+        classValue =
+          ee.Number(classValue);
+
+        var expansion =
+          pixelAreaHa
+            .updateMask(
+              persistentExpansion
+            )
+            .updateMask(
+              slopeClass.eq(
+                classValue
+              )
+            )
+            .reduceRegion({
+
+              reducer:
+                ee.Reducer.sum(),
+
+              geometry:
+                roi,
+
+              scale:
+                summaryScale,
+
+              maxPixels:
+                1e9,
+
+              bestEffort:
+                true,
+
+              tileScale:
+                16
+
+            })
+            .get('area_ha');
+
+
+        var landscape =
+          pixelAreaHa
+            .updateMask(
+              slopeClass.eq(
+                classValue
+              )
+            )
+            .reduceRegion({
+
+              reducer:
+                ee.Reducer.sum(),
+
+              geometry:
+                roi,
+
+              scale:
+                summaryScale,
+
+              maxPixels:
+                1e9,
+
+              bestEffort:
+                true,
+
+              tileScale:
+                16
+
+            })
+            .get('area_ha');
+
+
+        return ee.Feature(
+          null,
+          {
+            variable:
+              'slope',
+
+            class:
+              classValue,
+
+            expansion_area_ha:
+              expansion,
+
+            landscape_area_ha:
+              landscape
+          }
+        );
+
+      }
+    )
+  );
+
+
+// ============================================================================
+// 39. VALIDATION POPULATION
+// ============================================================================
+//
+// The exported points are NOT yet accuracy-assessment results.
+//
+// They are candidate reference points that must subsequently be interpreted
+// using multi-date high-resolution imagery.
+//
+// This is required for:
+//   - transition confusion matrix
+//   - user's accuracy
+//   - producer's accuracy
+//   - overall accuracy
+//   - area-adjusted class estimates
+//   - 95% confidence intervals
+// ============================================================================
+
+var validationPopulation =
+  transitionMasked
+    .rename('map_class')
+    .addBands([
+      elevation,
+      slope,
+      dw2019.rename(
+        'tree_probability_2019'
+      ),
+      dw2020.rename(
+        'tree_probability_2020'
+      ),
+      dw2021.rename(
+        'tree_probability_2021'
+      ),
+      dw2022.rename(
+        'tree_probability_2022'
+      ),
+      dw2023.rename(
+        'tree_probability_2023'
+      ),
+      dw2024.rename(
+        'tree_probability_2024'
+      ),
+      dw2025.rename(
+        'tree_probability_2025'
+      ),
+      ndviChange,
+      ndmiChange
+    ]);
+
+
+// ============================================================================
+// 40. STRATIFIED VALIDATION SAMPLE
+// ============================================================================
+//
+// Classes sampled:
+//
+// 1 stable nonforest
+// 2 persistent woody expansion
+// 3 woody loss
+// 4 stable woody
+// 5 uncertain transition
+//
+// If a class contains fewer points than requested, GEE returns the available
+// number.
+// ============================================================================
+
+var validationSamples =
+  validationPopulation
+    .stratifiedSample({
+
+      numPoints:
+        validationPointsPerClass,
+
+      classBand:
+        'map_class',
+
+      region:
+        roi,
+
+      scale:
+        summaryScale,
+
+      classValues:
+        [1, 2, 3, 4, 5],
+
+      classPoints:
+        [
+          validationPointsPerClass,
+          validationPointsPerClass,
+          validationPointsPerClass,
+          validationPointsPerClass,
+          validationPointsPerClass
+        ],
+
+      geometries:
+        true,
+
+      seed:
+        2026,
+
+      tileScale:
+        16
+    });
+
+
+var validationSamplesFinal =
+  validationSamples.map(
+    function(feature) {
+
+      var coordinates =
+        feature.geometry()
+          .coordinates();
+
+      return feature.set({
+
+        sample_id:
+          feature.id(),
+
+        longitude:
+          coordinates.get(0),
+
+        latitude:
+          coordinates.get(1),
+
+        // --------------------------------------------------------------
+        // Reference labels must be filled after visual interpretation.
+        // --------------------------------------------------------------
+
+        reference_class:
+          null,
+
+        reference_2019:
+          null,
+
+        reference_2020:
+          null,
+
+        reference_2021:
+          null,
+
+        reference_2022:
+          null,
+
+        reference_2023:
+          null,
+
+        reference_2024:
+          null,
+
+        reference_2025:
+          null,
+
+        reference_notes:
+          null
+      });
+    }
+  );
+
+
+print(
+  'Validation candidate sample count',
+  validationSamplesFinal.size()
+);
+
+
+// ============================================================================
+// 41. VALIDATION CLASS DEFINITIONS
+// ============================================================================
+
+var validationClassDefinitions =
+  ee.FeatureCollection([
+
+    ee.Feature(null, {
+      map_class: 1,
+      class_name:
+        'stable_nonforest'
+    }),
+
+    ee.Feature(null, {
+      map_class: 2,
+      class_name:
+        'persistent_woody_expansion'
+    }),
+
+    ee.Feature(null, {
+      map_class: 3,
+      class_name:
+        'woody_loss'
+    }),
+
+    ee.Feature(null, {
+      map_class: 4,
+      class_name:
+        'stable_woody'
+    }),
+
+    ee.Feature(null, {
+      map_class: 5,
+      class_name:
+        'uncertain_transition'
+    })
+  ]);
+
+
+// ============================================================================
+// 42. TRANSITION FREQUENCY DIAGNOSTIC
+// ============================================================================
+//
+// This should now contain only classes 1–5.
+// Class 6 should NOT appear.
+// ============================================================================
+
+var transitionFrequency =
+  transitionMasked
+    .reduceRegion({
+
+      reducer:
+        ee.Reducer.frequencyHistogram(),
+
+      geometry:
+        roi,
+
+      scale:
+        100,
+
+      maxPixels:
+        1e9,
+
+      bestEffort:
+        true,
+
+      tileScale:
+        8
+
+    });
+
+
+print(
+  'Transition class frequency',
+  transitionFrequency
+);
+
+
+// ============================================================================
+// 43. DIAGNOSTIC AREA TABLE
+// ============================================================================
+//
+// A compact CSV-ready table containing the main mapped quantities.
+// ============================================================================
+
+var diagnosticAreaTable =
+  ee.FeatureCollection([
+
+    ee.Feature(null, {
+      metric:
+        'persistent_woody_expansion_3yr',
+
+      area_ha:
+        areaForMask(
+          persistentExpansion
+        )
+    }),
+
+    ee.Feature(null, {
+      metric:
+        'persistent_woody_expansion_2yr_sensitivity',
+
+      area_ha:
+        areaForMask(
+          persistentExpansionTwoYear
+        )
+    }),
+
+    ee.Feature(null, {
+      metric:
+        'open_land_to_woody',
+
+      area_ha:
+        areaForMask(
+          openLandExpansion
+        )
+    }),
+
+    ee.Feature(null, {
+      metric:
+        'cropland_to_woody',
+
+      area_ha:
+        areaForMask(
+          cropExpansion
+        )
+    }),
+
+    ee.Feature(null, {
+      metric:
+        'woody_loss',
+
+      area_ha:
+        areaForMask(
+          woodyLoss
+        )
+    }),
+
+    ee.Feature(null, {
+      metric:
+        'stable_woody',
+
+      area_ha:
+        areaForMask(
+          stableWoody
+        )
+    }),
+
+    ee.Feature(null, {
+      metric:
+        'stable_nonforest',
+
+      area_ha:
+        areaForMask(
+          stableNonForest
+        )
+    }),
+
+    ee.Feature(null, {
+      metric:
+        'uncertain_transition',
+
+      area_ha:
+        areaForMask(
+          uncertainTransition
+        )
+    })
+  ]);
+
+
+// ============================================================================
+// 44. EXPORT: VALIDATION SAMPLE
+// ============================================================================
+
+Export.table.toDrive({
+
+  collection:
+    validationSamplesFinal,
+
+  description:
+    'BMER_Woody_Transition_Validation_Samples_2019_2025',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Woody_Transition_Validation_Samples_2019_2025',
+
+  fileFormat:
+    'CSV'
+});
+
+
+// ============================================================================
+// 45. EXPORT: MAP CLASS AREAS
+// ============================================================================
+
+Export.table.toDrive({
+
+  collection:
+    mapAreaTable,
+
+  description:
+    'BMER_Woody_Map_Class_Areas_2019_2025',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Woody_Map_Class_Areas_2019_2025',
+
+  fileFormat:
+    'CSV'
+});
+
+
+// ============================================================================
+// 46. EXPORT: DIAGNOSTIC AREA TABLE
+// ============================================================================
+
+Export.table.toDrive({
+
+  collection:
+    diagnosticAreaTable,
+
+  description:
+    'BMER_Woody_Diagnostic_Areas_2019_2025',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Woody_Diagnostic_Areas_2019_2025',
+
+  fileFormat:
+    'CSV'
+});
+
+
+// ============================================================================
+// 47. EXPORT: ELEVATION SELECTION TABLE
+// ============================================================================
+
+Export.table.toDrive({
+
+  collection:
+    elevationSelectionTable,
+
+  description:
+    'BMER_Woody_Expansion_Elevation_Selection_2019_2025',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Woody_Expansion_Elevation_Selection_2019_2025',
+
+  fileFormat:
+    'CSV'
+});
+
+
+// ============================================================================
+// 48. EXPORT: SLOPE SELECTION TABLE
+// ============================================================================
+
+Export.table.toDrive({
+
+  collection:
+    slopeSelectionTable,
+
+  description:
+    'BMER_Woody_Expansion_Slope_Selection_2019_2025',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Woody_Expansion_Slope_Selection_2019_2025',
+
+  fileFormat:
+    'CSV'
+});
+
+
+// ============================================================================
+// 49. EXPORT: TRANSITION CROSSWALK
+// ============================================================================
+
+Export.table.toDrive({
+
+  collection:
+    transitionCrosswalk,
+
+  description:
+    'BMER_Woody_Transition_Class_Crosswalk',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Woody_Transition_Class_Crosswalk',
+
+  fileFormat:
+    'CSV'
+});
+
+
+// ============================================================================
+// 50. EXPORT: VALIDATION CLASS DEFINITIONS
+// ============================================================================
+
+Export.table.toDrive({
+
+  collection:
+    validationClassDefinitions,
+
+  description:
+    'BMER_Woody_Validation_Class_Definitions',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Woody_Validation_Class_Definitions',
+
+  fileFormat:
+    'CSV'
+});
+
+
+// ============================================================================
+// 51. EXPORT: PERSISTENT EXPANSION MAP
+// ============================================================================
+
+Export.image.toDrive({
+
+  image:
+    persistentExpansion
+      .unmask(0)
+      .toByte(),
+
+  description:
+    'BMER_Persistent_Woody_Expansion_2019_2025_10m',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Persistent_Woody_Expansion_2019_2025_10m',
+
+  region:
+    roi,
+
+  scale:
+    10,
+
+  maxPixels:
+    1e13,
+
+  fileFormat:
+    'GeoTIFF'
+});
+
+
+// ============================================================================
+// 52. EXPORT: TRANSITION MAP
+// ============================================================================
+//
+// 0 = no-data/excluded
+// 1 = stable nonforest
+// 2 = persistent woody expansion
+// 3 = woody loss
+// 4 = stable woody
+// 5 = uncertain transition
+// ============================================================================
+
+Export.image.toDrive({
+
+  image:
+    transition.toByte(),
+
+  description:
+    'BMER_Woody_Transition_2019_2025_10m',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Woody_Transition_2019_2025_10m',
+
+  region:
+    roi,
+
+  scale:
+    10,
+
+  maxPixels:
+    1e13,
+
+  fileFormat:
+    'GeoTIFF'
+});
+
+
+// ============================================================================
+// 53. EXPORT: OPEN-LAND EXPANSION
+// ============================================================================
+
+Export.image.toDrive({
+
+  image:
+    openLandExpansion
+      .unmask(0)
+      .toByte(),
+
+  description:
+    'BMER_OpenLand_to_Woody_Expansion_2019_2025',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_OpenLand_to_Woody_Expansion_2019_2025',
+
+  region:
+    roi,
+
+  scale:
+    10,
+
+  maxPixels:
+    1e13,
+
+  fileFormat:
+    'GeoTIFF'
+});
+
+
+// ============================================================================
+// 54. EXPORT: CROPLAND EXPANSION
+// ============================================================================
+
+Export.image.toDrive({
+
+  image:
+    cropExpansion
+      .unmask(0)
+      .toByte(),
+
+  description:
+    'BMER_Cropland_to_Woody_Expansion_2019_2025',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Cropland_to_Woody_Expansion_2019_2025',
+
+  region:
+    roi,
+
+  scale:
+    10,
+
+  maxPixels:
+    1e13,
+
+  fileFormat:
+    'GeoTIFF'
+});
+
+
+// ============================================================================
+// 55. EXPORT: WOODY LOSS
+// ============================================================================
+
+Export.image.toDrive({
+
+  image:
+    woodyLoss
+      .unmask(0)
+      .toByte(),
+
+  description:
+    'BMER_Woody_Loss_2019_2025',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Woody_Loss_2019_2025',
+
+  region:
+    roi,
+
+  scale:
+    10,
+
+  maxPixels:
+    1e13,
+
+  fileFormat:
+    'GeoTIFF'
+});
+
+
+// ============================================================================
+// 56. EXPORT: DYNAMIC WORLD TREE PROBABILITY CHANGE
+// ============================================================================
+
+Export.image.toDrive({
+
+  image:
+    dw2025
+      .subtract(dw2019)
+      .rename(
+        'tree_probability_change'
+      )
+      .toFloat(),
+
+  description:
+    'BMER_DW_Tree_Probability_Change_2019_2025',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_DW_Tree_Probability_Change_2019_2025',
+
+  region:
+    roi,
+
+  scale:
+    10,
+
+  maxPixels:
+    1e13,
+
+  fileFormat:
+    'GeoTIFF'
+});
+
+
+// ============================================================================
+// 57. EXPORT: SENTINEL-2 NDVI CHANGE
+// ============================================================================
+
+Export.image.toDrive({
+
+  image:
+    ndviChange.toFloat(),
+
+  description:
+    'BMER_S2_NDVI_Change_2019_2025',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_S2_NDVI_Change_2019_2025',
+
+  region:
+    roi,
+
+  scale:
+    10,
+
+  maxPixels:
+    1e13,
+
+  fileFormat:
+    'GeoTIFF'
+});
+
+
+// ============================================================================
+// 58. EXPORT: ELEVATION CLASS
+// ============================================================================
+
+Export.image.toDrive({
+
+  image:
+    elevationClass.toByte(),
+
+  description:
+    'BMER_Elevation_Class',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Elevation_Class',
+
+  region:
+    roi,
+
+  scale:
+    30,
+
+  maxPixels:
+    1e13,
+
+  fileFormat:
+    'GeoTIFF'
+});
+
+
+// ============================================================================
+// 59. EXPORT: SLOPE CLASS
+// ============================================================================
+
+Export.image.toDrive({
+
+  image:
+    slopeClass.toByte(),
+
+  description:
+    'BMER_Slope_Class',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_Slope_Class',
+
+  region:
+    roi,
+
+  scale:
+    30,
+
+  maxPixels:
+    1e13,
+
+  fileFormat:
+    'GeoTIFF'
+});
+
+
+// ============================================================================
+// 60. EXPORT: ANNUAL DYNAMIC WORLD TREE-PROBABILITY STACK
+// ============================================================================
+
+var annualDWStack =
+  dw2019
+    .rename(
+      'tree_probability_2019'
+    )
+    .addBands(
+      dw2020.rename(
+        'tree_probability_2020'
+      )
+    )
+    .addBands(
+      dw2021.rename(
+        'tree_probability_2021'
+      )
+    )
+    .addBands(
+      dw2022.rename(
+        'tree_probability_2022'
+      )
+    )
+    .addBands(
+      dw2023.rename(
+        'tree_probability_2023'
+      )
+    )
+    .addBands(
+      dw2024.rename(
+        'tree_probability_2024'
+      )
+    )
+    .addBands(
+      dw2025.rename(
+        'tree_probability_2025'
+      )
+    )
+    .toFloat();
+
+
+Export.image.toDrive({
+
+  image:
+    annualDWStack,
+
+  description:
+    'BMER_DW_Annual_Tree_Probability_2019_2025',
+
+  folder:
+    'BMER_Woody_Analysis',
+
+  fileNamePrefix:
+    'BMER_DW_Annual_Tree_Probability_2019_2025',
+
+  region:
+    roi,
+
+  scale:
+    10,
+
+  maxPixels:
+    1e13,
+
+  fileFormat:
+    'GeoTIFF'
+});
+
+
+// ============================================================================
+// 61. FINAL DIAGNOSTIC SUMMARY
+// ============================================================================
+
+print(
+  '===================================================='
+);
+
+print(
+  'FINAL PERSISTENT WOODY-COVER ANALYSIS'
+);
+
+print(
+  'Bale Mountains Eco-Region, Ethiopia'
+);
+
+print(
+  'Study period: 2019–2025'
+);
+
+print(
+  'Baseline DW tree probability <',
+  baselineTreeThreshold
+);
+
+print(
+  'Woody DW tree probability >=',
+  woodyProbabilityThreshold
+);
+
+print(
+  'Primary persistence:',
+  minimumConsecutiveYears,
+  'consecutive years'
+);
+
+print(
+  'Sensitivity persistence:',
+  sensitivityConsecutiveYears,
+  'years'
+);
+
+print(
+  'Sentinel-2 NDVI increase >=',
+  minNDVIIncrease
+);
+
+print(
+  'Sentinel-2 NDMI change >=',
+  minNDMIChange
+);
+
+print(
+  'Minimum mapping unit:',
+  minimumMappingUnitHa,
+  'ha'
+);
+
+print(
+  'Mapping resolution:',
+  mappingScale,
+  'm'
+);
+
+print(
+  'Summary resolution:',
+  summaryScale,
+  'm'
+);
+
+print(
+  'GLI planting polygons: NOT USED'
+);
+
+print(
+  'Transition classes:',
+  '1 stable nonforest; 2 persistent expansion; 3 woody loss; 4 stable woody; 5 uncertain'
+);
+
+print(
+  'Class 6: REMOVED'
+);
+
+print(
+  '===================================================='
+);
+
+Export.image.toDrive({
+  image: dw2025.select('trees'),
+  description: 'DW_Tree_Probability_2025_BMER',
+  folder: 'BMER_DynamicWorld',
+  fileNamePrefix: 'DW_Tree_Probability_2025_BMER',
+  region: roi,
+  scale: 10,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
