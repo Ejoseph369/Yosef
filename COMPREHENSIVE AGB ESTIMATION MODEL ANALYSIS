@@ -1,0 +1,729 @@
+# COMPREHENSIVE AGB ESTIMATION MODEL ANALYSIS
+# Comparing Vegetation Indices with Above Ground Biomass Density (AGBD)
+# ============================================================================
+
+# Load required libraries
+library(ggplot2)
+library(ggpubr)
+library(GGally)
+library(corrplot)
+library(caret)
+library(randomForest)
+library(e1071)
+library(gridExtra)
+library(reshape2)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(grid)  # <-- ADD THIS LINE
+# Set working directory
+setwd("G:/My Drive/AGB")
+
+# 1. READ AND PREPARE DATA ---------------------------------------------------
+df <- read.csv("RF_AGB_training_2019_2024_2.csv", stringsAsFactors = FALSE)
+
+# Filter and clean AGBD values (0-350 Mg ha⁻¹ range)
+df <- df %>%
+  filter(
+    !is.na(agbd),
+    agbd > 0,
+    agbd < 350
+  )
+
+# Transform SAR backscatter to dB scale and compute ratio
+df <- df %>%
+  mutate(
+    VV_dB = 10 * log10(abs(VV)),
+    VH_dB = 10 * log10(abs(VH)),
+    VV_VH_dB = VV_dB - VH_dB
+  ) %>%
+  select(-VV, -VH)
+
+# Clamp vegetation indices to theoretical ranges
+df <- df %>%
+  mutate(
+    NDVI = pmin(pmax(NDVI, 0), 1),
+    RENDVI = pmin(pmax(RENDVI, 0), 1),
+    SAVI = pmin(pmax(SAVI, 0), 1.2),
+    EVI = pmin(pmax(EVI, 0), 2.0)
+  )
+
+# Log-transform AGBD
+df <- df %>%
+  mutate(agbd_log = log1p(agbd))
+
+# ================================================================
+# 2. FEATURE SET DEFINITION
+# ================================================================
+
+optical_vars <- c(
+  "NDVI",
+  "RENDVI",
+  "SAVI"
+)
+
+sar_vars <- c(
+  "VV_dB",
+  "VH_dB",
+  "VV_VH_dB"
+)
+
+feature_sets <- list(
+  optical_only = optical_vars,
+  sar_only     = sar_vars,
+  combined     = c(optical_vars, sar_vars)
+)
+
+
+# ================================================================
+# 3. TRAIN-TEST SPLIT
+# ================================================================
+
+set.seed(42)
+
+train_index <- createDataPartition(
+  df$agbd_log,
+  p = 0.7,
+  list = FALSE
+)
+
+train <- df[train_index, ]
+test  <- df[-train_index, ]
+
+
+create_feature_matrix <- function(features, data) {
+  as.matrix(data[, features, drop = FALSE])
+}
+
+
+# Optical
+X_train_opt <- create_feature_matrix(
+  feature_sets$optical_only,
+  train
+)
+
+X_test_opt <- create_feature_matrix(
+  feature_sets$optical_only,
+  test
+)
+
+
+# SAR only
+X_train_sar <- create_feature_matrix(
+  feature_sets$sar_only,
+  train
+)
+
+X_test_sar <- create_feature_matrix(
+  feature_sets$sar_only,
+  test
+)
+
+
+# Optical + SAR
+X_train_all <- create_feature_matrix(
+  feature_sets$combined,
+  train
+)
+
+X_test_all <- create_feature_matrix(
+  feature_sets$combined,
+  test
+)
+
+
+# Response variables
+y_train   <- train$agbd_log
+y_test    <- test$agbd_log
+agbd_test <- test$agbd
+
+
+# ================================================================
+# 4. MODEL TRAINING
+# ================================================================
+
+# ------------------------------------------------
+# Multiple Linear Regression
+# ------------------------------------------------
+
+# Optical
+mlr_opt <- lm(
+  agbd_log ~ .,
+  data = data.frame(
+    agbd_log = y_train,
+    X_train_opt
+  )
+)
+
+# SAR only
+mlr_sar <- lm(
+  agbd_log ~ .,
+  data = data.frame(
+    agbd_log = y_train,
+    X_train_sar
+  )
+)
+
+# Optical + SAR
+mlr_all <- lm(
+  agbd_log ~ .,
+  data = data.frame(
+    agbd_log = y_train,
+    X_train_all
+  )
+)
+
+
+# ------------------------------------------------
+# Support Vector Regression
+# ------------------------------------------------
+
+# Optical
+svr_opt <- svm(
+  x = X_train_opt,
+  y = y_train,
+  kernel = "radial",
+  cost = 10,
+  gamma = 0.1,
+  scale = TRUE
+)
+
+# SAR only
+svr_sar <- svm(
+  x = X_train_sar,
+  y = y_train,
+  kernel = "radial",
+  cost = 10,
+  gamma = 0.1,
+  scale = TRUE
+)
+
+# Optical + SAR
+svr_all <- svm(
+  x = X_train_all,
+  y = y_train,
+  kernel = "radial",
+  cost = 10,
+  gamma = 0.1,
+  scale = TRUE
+)
+
+
+# ------------------------------------------------
+# Random Forest
+# ------------------------------------------------
+
+set.seed(42)
+
+# Optical
+rf_opt <- randomForest(
+  x = X_train_opt,
+  y = train$agbd,
+  ntree = 500,
+  importance = TRUE,
+  keep.forest = TRUE
+)
+
+# SAR only
+rf_sar <- randomForest(
+  x = X_train_sar,
+  y = train$agbd,
+  ntree = 500,
+  importance = TRUE,
+  keep.forest = TRUE
+)
+
+# Optical + SAR
+rf_all <- randomForest(
+  x = X_train_all,
+  y = train$agbd,
+  ntree = 500,
+  importance = TRUE,
+  keep.forest = TRUE
+)
+
+
+# ================================================================
+# 5. PREDICTIONS
+# ================================================================
+
+# ------------------------------------------------
+# MLR
+# ------------------------------------------------
+
+mlr_pred_opt <- expm1(
+  predict(
+    mlr_opt,
+    as.data.frame(X_test_opt)
+  )
+)
+
+mlr_pred_sar <- expm1(
+  predict(
+    mlr_sar,
+    as.data.frame(X_test_sar)
+  )
+)
+
+mlr_pred_all <- expm1(
+  predict(
+    mlr_all,
+    as.data.frame(X_test_all)
+  )
+)
+
+
+# ------------------------------------------------
+# SVR
+# ------------------------------------------------
+
+svr_pred_opt <- expm1(
+  predict(
+    svr_opt,
+    X_test_opt
+  )
+)
+
+svr_pred_sar <- expm1(
+  predict(
+    svr_sar,
+    X_test_sar
+  )
+)
+
+svr_pred_all <- expm1(
+  predict(
+    svr_all,
+    X_test_all
+  )
+)
+
+
+# ------------------------------------------------
+# Random Forest
+# ------------------------------------------------
+
+rf_pred_opt <- predict(
+  rf_opt,
+  X_test_opt
+)
+
+rf_pred_sar <- predict(
+  rf_sar,
+  X_test_sar
+)
+
+rf_pred_all <- predict(
+  rf_all,
+  X_test_all
+)
+
+
+# ================================================================
+# 6. EVALUATION
+# ================================================================
+
+evaluate_model <- function(observed, predicted) {
+  
+  data.frame(
+    
+    R2 = cor(
+      observed,
+      predicted,
+      use = "complete.obs"
+    )^2,
+    
+    RMSE = sqrt(
+      mean(
+        (observed - predicted)^2,
+        na.rm = TRUE
+      )
+    ),
+    
+    MAE = mean(
+      abs(observed - predicted),
+      na.rm = TRUE
+    ),
+    
+    Bias = mean(
+      predicted - observed,
+      na.rm = TRUE
+    ),
+    
+    RRMSE = (
+      sqrt(
+        mean(
+          (observed - predicted)^2,
+          na.rm = TRUE
+        )
+      ) /
+        mean(observed, na.rm = TRUE)
+    ) * 100
+  )
+}
+
+
+# ================================================================
+# 7. FINAL MODEL COMPARISON TABLE
+# ================================================================
+
+results <- rbind(
+  
+  # Optical only
+  cbind(
+    Model = "MLR",
+    Predictor_configuration = "Optical",
+    evaluate_model(
+      agbd_test,
+      mlr_pred_opt
+    )
+  ),
+  
+  cbind(
+    Model = "SVR",
+    Predictor_configuration = "Optical",
+    evaluate_model(
+      agbd_test,
+      svr_pred_opt
+    )
+  ),
+  
+  cbind(
+    Model = "RF",
+    Predictor_configuration = "Optical",
+    evaluate_model(
+      agbd_test,
+      rf_pred_opt
+    )
+  ),
+  
+  
+  # SAR only
+  cbind(
+    Model = "MLR",
+    Predictor_configuration = "SAR only",
+    evaluate_model(
+      agbd_test,
+      mlr_pred_sar
+    )
+  ),
+  
+  cbind(
+    Model = "SVR",
+    Predictor_configuration = "SAR only",
+    evaluate_model(
+      agbd_test,
+      svr_pred_sar
+    )
+  ),
+  
+  cbind(
+    Model = "RF",
+    Predictor_configuration = "SAR only",
+    evaluate_model(
+      agbd_test,
+      rf_pred_sar
+    )
+  ),
+  
+  
+  # Optical + SAR
+  cbind(
+    Model = "MLR",
+    Predictor_configuration = "Optical + SAR",
+    evaluate_model(
+      agbd_test,
+      mlr_pred_all
+    )
+  ),
+  
+  cbind(
+    Model = "SVR",
+    Predictor_configuration = "Optical + SAR",
+    evaluate_model(
+      agbd_test,
+      svr_pred_all
+    )
+  ),
+  
+  cbind(
+    Model = "RF",
+    Predictor_configuration = "Optical + SAR",
+    evaluate_model(
+      agbd_test,
+      rf_pred_all
+    )
+  )
+)
+
+
+# Convert numerical columns
+results <- results %>%
+  mutate(
+    across(
+      c(R2, RMSE, MAE, Bias, RRMSE),
+      as.numeric
+    )
+  )
+
+
+# Round for reporting
+results_report <- results %>%
+  mutate(
+    R2    = round(R2, 3),
+    RMSE  = round(RMSE, 2),
+    MAE   = round(MAE, 2),
+    Bias  = round(Bias, 2),
+    RRMSE = round(RRMSE, 2)
+  )
+
+
+print(results_report)
+
+
+write.csv(
+  results_report,
+  "AGBD_model_comparison_optical_SAR_combined.csv",
+  row.names = FALSE
+)
+
+
+# ================================================================
+# 8. SCATTER-PLOT FUNCTION
+# ================================================================
+
+create_scatter_plot <- function(
+    observed,
+    predicted,
+    panel_label,
+    color
+) {
+  
+  max_val <- max(
+    c(observed, predicted),
+    na.rm = TRUE
+  )
+  
+  r2 <- cor(
+    observed,
+    predicted,
+    use = "complete.obs"
+  )^2
+  
+  rmse <- sqrt(
+    mean(
+      (observed - predicted)^2,
+      na.rm = TRUE
+    )
+  )
+  
+  mae <- mean(
+    abs(observed - predicted),
+    na.rm = TRUE
+  )
+  
+  
+  ggplot(
+    data.frame(
+      Observed = observed,
+      Predicted = predicted
+    ),
+    aes(
+      x = Observed,
+      y = Predicted
+    )
+  ) +
+    
+    geom_point(
+      color = color,
+      size = 3,
+      alpha = 0.7
+    ) +
+    
+    geom_smooth(
+      method = "lm",
+      se = FALSE,
+      color = "red",
+      linewidth = 1
+    ) +
+    
+    geom_abline(
+      slope = 1,
+      intercept = 0,
+      linetype = "dashed",
+      linewidth = 0.8,
+      color = "gray30"
+    ) +
+    
+    coord_equal(
+      xlim = c(0, max_val * 1.05),
+      ylim = c(0, max_val * 1.05),
+      expand = FALSE
+    ) +
+    
+    labs(
+      x = expression(
+        bold("Observed AGB") ~
+          "(" * Mg ~ ha^{-1} * ")"
+      ),
+      y = expression(
+        bold("Predicted AGB") ~
+          "(" * Mg ~ ha^{-1} * ")"
+      )
+    ) +
+    
+    annotate(
+      "text",
+      x = max_val * 0.05,
+      y = max_val * 0.95,
+      label = panel_label,
+      hjust = 0,
+      vjust = 1,
+      size = 6,
+      fontface = "bold"
+    ) +
+    
+    annotate(
+      "text",
+      x = max_val * 0.05,
+      y = max_val * 0.80,
+      label = sprintf(
+        "R² = %.3f\nRMSE = %.2f\nMAE = %.2f",
+        r2,
+        rmse,
+        mae
+      ),
+      hjust = 0,
+      vjust = 1,
+      size = 4.5,
+      fontface = "bold"
+    ) +
+    
+    theme_minimal(base_size = 14) +
+    
+    theme(
+      text = element_text(
+        family = "Arial",
+        face = "bold"
+      ),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(
+        fill = NA,
+        color = "black",
+        linewidth = 1.2
+      )
+    )
+}
+
+
+# ================================================================
+# 9. OPTICAL-ONLY SCATTER PLOTS
+# ================================================================
+
+p_mlr_opt <- create_scatter_plot(
+  agbd_test, mlr_pred_opt, "(a)", "#2E86AB"
+)
+
+p_svr_opt <- create_scatter_plot(
+  agbd_test, svr_pred_opt, "(b)", "#A23B72"
+)
+
+p_rf_opt <- create_scatter_plot(
+  agbd_test, rf_pred_opt, "(c)", "#18A999"
+)
+
+optical_plot <- ggarrange(
+  p_mlr_opt,
+  p_svr_opt,
+  p_rf_opt,
+  ncol = 3,
+  align = "hv"
+)
+
+ggsave(
+  "optical_models_scatter.png",
+  optical_plot,
+  width = 12,
+  height = 5,
+  dpi = 600,
+  bg = "white"
+)
+print()
+
+# ================================================================
+# 10. SAR-ONLY SCATTER PLOTS
+# ================================================================
+
+p_mlr_sar <- create_scatter_plot(
+  agbd_test, mlr_pred_sar, "(a)", "#2E86AB"
+)
+
+p_svr_sar <- create_scatter_plot(
+  agbd_test, svr_pred_sar, "(b)", "#A23B72"
+)
+
+p_rf_sar <- create_scatter_plot(
+  agbd_test, rf_pred_sar, "(c)", "#18A999"
+)
+
+sar_plot <- ggarrange(
+  p_mlr_sar,
+  p_svr_sar,
+  p_rf_sar,
+  ncol = 3,
+  align = "hv"
+)
+
+print(sar_plot)
+
+ggsave(
+  "SAR_only_models_scatter.png",
+  sar_plot,
+  width = 12,
+  height = 5,
+  dpi = 600,
+  bg = "white"
+)
+
+
+# ================================================================
+# 11. OPTICAL + SAR SCATTER PLOTS
+# ================================================================
+
+p_mlr_all <- create_scatter_plot(
+  agbd_test, mlr_pred_all, "(a)", "#2E86AB"
+)
+
+p_svr_all <- create_scatter_plot(
+  agbd_test, svr_pred_all, "(b)", "#A23B72"
+)
+
+p_rf_all <- create_scatter_plot(
+  agbd_test, rf_pred_all, "(c)", "#18A999"
+)
+
+combined_plot <- ggarrange(
+  p_mlr_all,
+  p_svr_all,
+  p_rf_all,
+  ncol = 3,
+  align = "hv"
+)
+
+print(combined_plot)
+
+ggsave(
+  "combined_models_scatter.png",
+  combined_plot,
+  width = 12,
+  height = 5,
+  dpi = 600,
+  bg = "white"
+)
+# 8. RANDOM FOREST FEATURE IMPORTANCE ----------------------------------------
+if (exists("rf_all")) {
+  png("rf_feature_importance.png", width = 12, height = 8, units = "in", res = 400, bg = "white")
+  varImpPlot(rf_all, main = "Random Forest Feature Importance (Optical + SAR)",
+             cex.main = 1.5, cex.lab = 1.2, cex.names = 1.1)
+  dev.off()
+}
