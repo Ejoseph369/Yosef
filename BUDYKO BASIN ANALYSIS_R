@@ -1,0 +1,1520 @@
+
+# ================================================================
+# BUDYKO BASIN ANALYSIS: PRE- AND POST-GLI COMPARISON
+# Basin identifier: HYBAS_ID
+# Annual variables: ET, PET, P_mm
+# Pre-period:  year < 2019
+# Post-period: year >= 2019
+# ===============================
+# 0. LIBRARIES
+# ===============================
+library(data.table)
+library(dplyr)
+library(fixest)
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+library(boot)
+library(readr)
+# ===============================
+setwd("H:/My Drive/R_Results")
+theme_pub <- theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    plot.subtitle = element_text(hjust = 0,face = "bold", size = 13, color = "gray30"),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.title.x = element_text(margin = margin(t = 12),face = "bold"),
+    axis.title.y = element_text(margin = margin(r = 11), face = "bold"),
+    axis.text = element_text(color = "black", size = 12, face = "bold"),
+    panel.grid.major = element_line(color = "gray90", linetype = "dotted"),
+    plot.caption = element_text(size = 9, color = "gray40", hjust = 0),
+    axis.line = element_line(color = "black", linewidth = 1),
+    plot.margin = margin(15, 20, 15, 20),
+    legend.position = "top",
+    legend.title = element_text(face = "bold", size = 12),
+    legend.text = element_text(size = 12),
+    legend.box.margin = margin(t = -10),
+    legend.key.size = unit(0.8, "cm")
+  )
+theme_std <- theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 11, hjust = 0),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "black"),
+    axis.line = element_line(linewidth = 0.5),
+    plot.margin = margin(6, 8, 6, 6)
+  )
+# =========================================
+# FIGURE 3 — WATER TRADE-OFF
+# =========================================
+# ===============================
+panel_file <- "I:/Afforestation_Analysis/DiD_EventStudy_Panel_FINAL (done2).csv"
+onset <- 2019
+ref_year <- 2018                      # event-study reference year (k = -1), as in Fig. 3
+
+df <- fread(panel_file) %>%
+  mutate(year = as.integer(year), treated = as.integer(treated),
+         WB = ET - P_mm, CWD = PET - ET) %>%
+  filter(year >= 2015)
+
+# ---------------------------------------------------------------------------
+yr <- df %>%
+  group_by(year, treated) %>%
+  summarise(across(c(ET, P_mm, WB), list(m = ~mean(.x, na.rm = TRUE),
+                                         v = ~var(.x, na.rm = TRUE)),
+                   .names = "{.col}_{.fn}"),
+            n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = treated, values_from = c(ET_m, ET_v, P_mm_m, P_mm_v, WB_m, WB_v, n))
+
+gap <- yr %>%
+  transmute(year,
+            gap_ET = ET_m_1 - ET_m_0,
+            gap_P  = P_mm_m_1 - P_mm_m_0,
+            gap_WB = WB_m_1 - WB_m_0,
+            # naive SE of each gap (ignores spatial clustering; model SEs are below)
+            se_ET = sqrt(ET_v_1 / n_1 + ET_v_0 / n_0),
+            se_WB = sqrt(WB_v_1 / n_1 + WB_v_0 / n_0))
+
+# ---------------------------------------------------------------------------
+# 2. The reconciliation table (what the numbers in Section 3.3 are)
+# ---------------------------------------------------------------------------
+pre  <- gap %>% filter(year <  onset)
+post <- gap %>% filter(year >= onset)
+tab <- data.frame(
+  quantity = c("ET gap (treated - control)", "P gap (treated - control)", "WBP gap (treated - control)"),
+  pre_mean  = c(mean(pre$gap_ET),  mean(pre$gap_P),  mean(pre$gap_WB)),
+  post_mean = c(mean(post$gap_ET), mean(post$gap_P), mean(post$gap_WB)))
+tab$change_post_minus_pre <- tab$post_mean - tab$pre_mean      # simple DiD of the gaps
+tab$pct_of_pre_gap <- 100 * tab$change_post_minus_pre / abs(tab$pre_mean)
+print(tab, digits = 4)
+cat("\nIdentity check (WBP = ET - P): change_ET - change_P =",
+    round(tab$change_post_minus_pre[1] - tab$change_post_minus_pre[2], 2),
+    "| change_WBP =", round(tab$change_post_minus_pre[3], 2), "\n")
+
+# DiD series by year, two normalisations
+base_mean <- mean(pre$gap_WB); base_ref <- gap$gap_WB[gap$year == ref_year]
+gap <- gap %>% mutate(
+  did_ET_premean = gap_ET - mean(pre$gap_ET), did_ET_ref = gap_ET - gap_ET[year == ref_year],
+  did_WB_premean = gap_WB - base_mean,        did_WB_ref = gap_WB - base_ref)
+cat("\nPeak post-2019 DiD (pre-mean baseline): ET =", round(max(gap$did_ET_premean[gap$year >= onset]), 1),
+    "| WBP =", round(max(gap$did_WB_premean[gap$year >= onset]), 1), "\n")
+cat("Mean post-2019 DiD (pre-mean baseline): ET =", round(mean(gap$did_ET_premean[gap$year >= onset]), 1),
+    "| WBP =", round(mean(gap$did_WB_premean[gap$year >= onset]), 1), "\n")
+cat("Pre-period mean of the pre-mean-normalised series is exactly",
+    round(mean(gap$did_WB_premean[gap$year < onset]), 10),
+    "so a percent change computed from it divides by zero.\n")
+
+# ---------------------------------------------------------------------------
+# 3. Model-based event study with clustered SEs (same logic as Fig. 3)
+#    Adjust pixel_id / cluster_id to the column names in your panel file.
+# ---------------------------------------------------------------------------
+if (all(c("pixel_id", "cluster_id") %in% names(df))) {
+  es <- function(y) {
+    m <- feols(as.formula(paste(y, "~ i(year, treated, ref =", ref_year, ") | pixel_id + year")),
+               data = df, cluster = ~cluster_id)
+    ct <- as.data.table(coeftable(m), keep.rownames = "term")
+    setnames(ct, c("term", "est", "se", "t", "p"))
+    ct[, year := as.integer(sub(".*::([0-9]{4}).*", "\\1", term))]
+    ct[, `:=`(lo = est - 1.96 * se, hi = est + 1.96 * se)]
+    ct[]
+  }
+  es_ET <- es("ET"); es_WB <- es("WB"); es_P <- es("P_mm")
+  print(es_WB[year >= onset])
+} 
+
+# ---------------------------------------------------------------------------
+# 4. Panels (a) and (b); label (b) as the DiD-adjusted WBP change
+# ---------------------------------------------------------------------------
+panel <- function(d, y, lo, hi, title, ylab) {
+  ggplot(d, aes(year, .data[[y]])) +
+    annotate("rect", xmin = onset, xmax = max(d$year), ymin = -Inf, ymax = Inf, fill = "grey97") +
+    geom_vline(xintercept = onset, linetype = "dashed", colour = "grey40") +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_ribbon(aes(ymin = .data[[lo]], ymax = .data[[hi]]), fill = "grey30", alpha = 0.25) +
+    geom_line(colour = "blue", linewidth = 1.2) + geom_point(colour = "blue", size = 2.3) +
+    scale_x_continuous(breaks = sort(unique(d$year))) +
+    labs(title = title, y = ylab, x = "Year") +
+    theme_minimal(base_size = 13) + theme(plot.title.position = "plot")
+}
+if (exists("es_ET")) {
+  pa <- panel(es_ET, "est", "lo", "hi", "(a)", expression(Delta*ET~(mm~yr^{-1})))
+  pb <- panel(es_WB, "est", "lo", "hi", "(b)", "DiD-adjusted ΔWBP (mm/yr)")
+  print(pa | pb)   # needs library(patchwork)
+}
+
+
+# ===============================
+# 2. YEARLY SUMMARY (MEAN + SE)
+# ===============================
+df_year <- df %>%
+  group_by(year, treated) %>%
+  summarise(
+    ET  = mean(ET, na.rm = TRUE),
+    ET_sd = sd(ET, na.rm = TRUE),
+    
+    
+    WB  = mean(WB, na.rm = TRUE),
+    WB_sd = sd(WB, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+# ===============================
+# 3. TREATED – CONTROL DIFFERENCE
+# ===============================
+df_diff <- df_year %>%
+  pivot_wider(
+    names_from = treated,
+    values_from = c(ET,  WB, ET_sd, WB_sd)
+  ) %>%
+  mutate(
+    # Raw differences
+    dET  = ET_1  - ET_0,
+    dWB  = WB_1  - WB_0,
+    
+    # Standard errors of differences
+    se_dET  = sqrt(ET_sd_1^2  + ET_sd_0^2),
+    se_dWB  = sqrt(WB_sd_1^2  + WB_sd_0^2)
+  )
+
+# ===============================
+# 4. DiD NORMALIZATION (CRITICAL FIX)
+# ===============================
+baseline <- df_diff %>%
+  filter(year < 2019) %>%
+  summarise(
+    bET  = mean(dET, na.rm = TRUE),
+    bWB  = mean(dWB, na.rm = TRUE)
+  )
+
+df_diff <- df_diff %>%
+  mutate(
+    # Difference-in-differences (causal effects)
+    dET_did  = dET  - baseline$bET,
+    dWB_did  = dWB  - baseline$bWB,
+    
+    # 95% CI (unchanged SE, centered on DiD)
+    dET_lo  = dET_did  - 1.96 * se_dET,
+    dET_hi  = dET_did  + 1.96 * se_dET,
+    
+    dWB_lo  = dWB_did  - 1.96 * se_dWB,
+    dWB_hi  = dWB_did  + 1.96 * se_dWB,
+  )
+
+# ===============================
+# 2. GENERIC PLOT FUNCTION
+plot_clean <- function(data, y, ymin, ymax, title, ylab, threshold = NULL) {
+  
+  ggplot(data, aes(year, {{y}})) +
+    
+    # Post-treatment shading
+    annotate("rect", xmin = 2019, xmax = max(data$year),
+             ymin = -Inf, ymax = Inf,
+             fill = "grey97") +
+    
+    # Reference lines
+    geom_vline(xintercept = 2019,
+               linetype = "dashed",
+               color = "grey40",
+               linewidth = 0.5) +
+    
+    geom_hline(yintercept = 0,
+               linetype = "dashed",
+               color = "grey60",
+               linewidth = 0.4) +
+    
+    # Optional threshold
+    {if (!is.null(threshold))
+      geom_hline(yintercept = threshold,
+                 linetype = "longdash",
+                 color = "black",
+                 linewidth = 0.6)
+    } +
+    
+    # 🔥 Visible CI ribbon
+    geom_ribbon(
+      aes(ymin = {{ymin}}, ymax = {{ymax}}, group = 1),
+      fill = "grey7",
+      alpha = 0.25
+    ) +
+    
+    # Main signal
+    geom_line(linewidth = 1.2, color = "blue") +
+    geom_point(size = 2.3, color = "blue") +
+    
+    scale_x_continuous(breaks = sort(unique(data$year))) +
+    
+    labs(
+      title = title,
+      y = ylab,
+      x = "Year"
+    ) +
+    
+    theme_pub +theme(
+      plot.title = element_text(
+        hjust = 0,
+        face = "bold",
+        size = 16
+      ),
+      plot.title.position = "plot"
+    )
+  
+}
+
+#Seasonal
+dfs <- fread("I:/Afforestation_Analysis/DiD_Seasonal_Panel_FINAL.csv") %>%
+  mutate(
+    year    = as.integer(year),
+    treated = as.integer(treated),
+    season  = tolower(as.character(season)),
+    CWD = PET - ET,
+    WB  = ET - P_mm
+  ) %>%
+  filter(
+    !is.na(NDVI),
+    !is.na(ET),
+    !is.na(PET),
+    !is.na(LST),
+    !is.na(P_mm),
+    year >= 2015
+  )
+# ===============================
+# 2. SUMMARY
+df_summary <- dfs %>%
+  group_by(year, season, treated) %>%
+  summarise(
+    ET_mean = mean(ET, na.rm = TRUE),
+    ET_se   = sd(ET, na.rm = TRUE) / sqrt(n()),
+    
+    WB_mean = mean(WB, na.rm = TRUE),
+    WB_se   = sd(WB, na.rm = TRUE) / sqrt(n()),
+    
+    P_mean  = mean(P_mm, na.rm = TRUE),
+    P_se    = sd(P_mm, na.rm = TRUE) / sqrt(n()),
+    
+    CWD_mean = mean(CWD, na.rm = TRUE),
+    CWD_se   = sd(CWD, na.rm = TRUE) / sqrt(n()),
+    
+    .groups = "drop"
+  ) %>%
+  group_by(year, season) %>%
+  filter(n_distinct(treated) == 2) %>%   # enforce valid DiD comparison
+  ungroup()
+
+# ===============================
+# 3. DIFF
+# ===============================
+df_diff <- df_summary %>%
+  pivot_wider(
+    names_from  = treated,
+    values_from = c(ET_mean, ET_se, WB_mean, WB_se, P_mean, P_se, CWD_mean, CWD_se),
+    names_prefix = "T",
+    values_fn = mean   # 🔥 CRITICAL FIX
+  ) %>%
+  mutate(
+    ET_diff = ET_mean_T1 - ET_mean_T0,
+    WB_diff = WB_mean_T1 - WB_mean_T0,
+    P_diff  = P_mean_T1  - P_mean_T0,
+    CWD_diff = CWD_mean_T1 - CWD_mean_T0,
+    
+    ET_se_diff  = sqrt(ET_se_T1^2  + ET_se_T0^2),
+    WB_se_diff  = sqrt(WB_se_T1^2  + WB_se_T0^2),
+    P_se_diff   = sqrt(P_se_T1^2   + P_se_T0^2),
+    CWD_se_diff = sqrt(CWD_se_T1^2 + CWD_se_T0^2),
+    
+    ET_lo  = ET_diff  - 1.96 * ET_se_diff,
+    ET_hi  = ET_diff  + 1.96 * ET_se_diff,
+    
+    WB_lo  = WB_diff  - 1.96 * WB_se_diff,
+    WB_hi  = WB_diff  + 1.96 * WB_se_diff,
+    
+    P_lo   = P_diff   - 1.96 * P_se_diff,
+    P_hi   = P_diff   + 1.96 * P_se_diff,
+    
+    CWD_lo = CWD_diff - 1.96 * CWD_se_diff,
+    CWD_hi = CWD_diff + 1.96 * CWD_se_diff
+  )
+# ===============================
+# 4. PLOT FUNCTION
+plot_var <- function(data, var, lo, hi, title, ylab_expr){
+  
+  ggplot(data, aes(x = year, y = .data[[var]], color = season)) +
+    
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    
+    geom_ribbon(
+      aes(ymin = .data[[lo]], ymax = .data[[hi]], fill = season),
+      alpha = 0.1,
+      color = NA
+    ) +
+    
+    geom_line(linewidth = 1.1) +
+    geom_point(size = 2) +
+    
+    geom_vline(xintercept = 2019, linetype = "dashed", color = "grey40") +
+    
+    scale_x_continuous(breaks = sort(unique(data$year))) +
+    
+    scale_color_manual(
+      values = c("dry" = "orange", "wet" = "blue"),
+      labels = c("dry" = "Dry", "wet" = "Wet"),
+      name   = "Season"
+    ) +
+    
+    scale_fill_manual(
+      values = c("dry" = "orange", "wet" = "blue"),
+      guide = "none"
+    ) +
+    
+    theme_bw() +
+    labs(
+      title = title,
+      x = "Year",
+      y = ylab_expr
+    )
+}+theme_pub+theme(
+  plot.title = element_text(
+    hjust = 0,
+    face = "bold",
+    size = 16
+  ),
+  plot.title.position = "plot"
+)
+
+# ============================================================
+# 4. SEASONAL PLOT FUNCTION
+# ============================================================
+
+plot_var <- function(data, var, lo, hi, title, ylab_expr) {
+  
+  ggplot(data, aes(x = year, y = .data[[var]], color = season)) +
+    
+    annotate(
+      "rect",
+      xmin = 2019, xmax = max(data$year, na.rm = TRUE),
+      ymin = -Inf, ymax = Inf,
+      fill = "grey97"
+    ) +
+    
+    geom_hline(
+      yintercept = 0,
+      linetype = "dashed",
+      color = "grey60"
+    ) +
+    
+    geom_ribbon(
+      aes(ymin = .data[[lo]], ymax = .data[[hi]], fill = season),
+      alpha = 0.12,
+      color = NA
+    ) +
+    
+    geom_line(linewidth = 1.1) +
+    geom_point(size = 2) +
+    
+    geom_vline(
+      xintercept = 2019,
+      linetype = "dashed",
+      color = "grey40",
+      linewidth = 0.5
+    ) +
+    
+    scale_x_continuous(
+      breaks = sort(unique(data$year))
+    ) +
+    
+    scale_color_manual(
+      values = c("dry" = "orange", "wet" = "blue"),
+      labels = c("dry" = "Dry", "wet" = "Wet"),
+      name = "Season"
+    ) +
+    
+    scale_fill_manual(
+      values = c("dry" = "orange", "wet" = "blue"),
+      guide = "none"
+    ) +
+    
+    labs(
+      title = title,
+      x = "Year",
+      y = ylab_expr
+    ) +
+    
+    theme_pub +
+    
+    theme(
+      plot.title = element_text(
+        hjust = 0,
+        face = "bold",
+        size = 16
+      ),
+      plot.title.position = "plot"
+    )
+}
+
+# ============================================================
+# 5. SEASONAL PLOTS
+# ============================================================
+
+# (a) Seasonal evapotranspiration difference
+p_season_ET <- plot_var(
+  data = df_diff,
+  var = "ET_diff",
+  lo = "ET_lo",
+  hi = "ET_hi",
+  title = "(a)",
+  ylab_expr = expression(Delta*ET~(mm~yr^{-1}))
+)
+
+# (b) Seasonal water-balance difference
+p_season_WB <- plot_var(
+  data = df_diff,
+  var = "WB_diff",
+  lo = "WB_lo",
+  hi = "WB_hi",
+  title = "(b)",
+  ylab_expr = expression(Delta*WB~(mm~yr^{-1}))
+)
+
+# (c) Seasonal precipitation difference
+p_season_P <- plot_var(
+  data = df_diff,
+  var = "P_diff",
+  lo = "P_lo",
+  hi = "P_hi",
+  title = "(c)",
+  ylab_expr = expression(Delta*P~(mm~yr^{-1}))
+)
+
+# Display individual plots
+print(p_season_ET)
+print(p_season_WB)
+
+
+# Optional: combine seasonal plots
+p_ss <- p_season_WB 
+
+print(p_ss)
+
+# Export seasonal figure
+ggsave(
+  "Seasonal_Water_Tradeoffs.png",
+  plot = seasonal_fig,
+  width = 10,
+  height = 12,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+df_summary %>% count(year, season, treated)
+seasonal_summary <- df_diff %>%
+  group_by(season) %>%
+  summarise(
+    mean_ET = mean(ET_diff, na.rm = TRUE),
+    max_ET  = max(ET_diff, na.rm = TRUE),
+    
+    mean_WB = mean(WB_diff, na.rm = TRUE),
+    max_WB  = max(WB_diff, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+print(seasonal_summary)
+
+post_summary <- df_diff %>%
+  filter(year >= 2019) %>%
+  summarise(
+    mean_ET = mean(ET_diff, na.rm = TRUE),
+    max_ET  = max(ET_diff, na.rm = TRUE),
+    
+    mean_WB = mean(WB_diff, na.rm = TRUE),
+    max_WB  = max(WB_diff, na.rm = TRUE),
+    
+  )
+
+print(post_summary)
+
+pre_post <- df_diff %>%
+  mutate(period = ifelse(year < 2019, "pre", "post")) %>%
+  group_by(period) %>%
+  summarise(
+    ET = mean(ET_diff, na.rm = TRUE),
+    WB = mean(WB_diff, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(pre_post)
+
+percent_change <- pre_post %>%
+  tidyr::pivot_wider(names_from = period, values_from = c(ET, WB, CWD)) %>%
+  mutate(
+    ET_pct = 100 * (ET_post - ET_pre) / abs(ET_pre),
+    WB_pct = 100 * (WB_post - WB_pre) / abs(WB_pre)
+  )
+
+print(percent_change)
+#PP
+dfpp <- fread("I:/Afforestation_Analysis/Figure3_WaterTradeoff_CWD_WB - Copy.csv") %>%
+  mutate(
+    year = as.integer(year),
+    treated = as.integer(treated),
+    
+    # Hydrological variables
+    CWD = PET - ET,
+    WB  = ET - P_mm
+  ) %>%
+  filter(year >= 2015)
+df_p <- dfpp %>%
+  group_by(year) %>%
+  summarise(
+    P = mean(P_mm, na.rm = TRUE),
+    P_sd = sd(P_mm, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    P_lo = P - 1.96 * P_sd,
+    P_hi = P + 1.96 * P_sd
+  )
+# 1. FUNCTION TO COMPUTE STATS
+get_stats <- function(df, yvar) {
+  model <- lm(df[[yvar]] ~ df$year)
+  r2 <- summary(model)$r.squared
+  r  <- cor(df[[yvar]], df$year, use = "complete.obs")
+  
+  list(
+    label = paste0("R = ", sprintf("%.2f", r),
+                   "\nR² = ", sprintf("%.2f", r2))
+  )
+}
+
+plot_p_context <- function(data) {
+  
+  stats <- get_stats(data, "P")
+  
+  y_min <- min(data$P, na.rm = TRUE)
+  y_max <- max(data$P, na.rm = TRUE)
+  
+  ggplot(data, aes(year, P)) +
+    
+    annotate("rect", xmin = 2019, xmax = 2025,
+             ymin = -Inf, ymax = Inf,
+             fill = "grey97") +
+    
+    geom_vline(xintercept = 2019,
+               linetype = "dashed",
+               color = "grey40",
+               linewidth = 0.4) +
+    
+    geom_ribbon(
+      aes(ymin = P_lo, ymax = P_hi),
+      fill = "dodgerblue",
+      alpha = 0.25
+    ) +
+    
+    geom_line(color = "blue", linewidth = 1) +
+    geom_point(size = 2, color = "blue") +
+    
+    scale_x_continuous(breaks = 2015:2025) +
+    
+    labs(
+      title = "(d)",
+      y = "Precipitation (mm yr⁻¹)",
+      x = "Year"
+    ) +
+    
+    theme_pub+ theme(
+      plot.title = element_text(
+        hjust = 0,
+        face = "bold",
+        size = 16
+      ),
+      plot.title.position = "plot"
+    )
+  
+}
+
+p_pp <- plot_p_context(df_p)
+
+print(p_pp)
+# ===============================
+# 3. APPLY TO PANELS
+p_a <- plot_clean(
+  df_diff,
+  dET_did, dET_lo, dET_hi,
+  "(a) ",expression(Delta*ET~(mm~yr^{-1}))
+)
+
+
+p_b <- plot_clean(
+  df_diff,
+  dWB_did, dWB_lo, dWB_hi,
+  "(b)",expression(Delta*(WBP)~(mm~yr^{-1}))
+)
+
+print(p_b)
+
+
+# 4. FINAL FIGURE
+# ===============================
+fig3 <- (p_a | p_b) / (p_ss | p_pp)
+print(fig3)
+ggsave("Budyko_update.png",
+       fig3,
+       width = 14,
+       height = 8,
+       dpi = 600)
+
+
+ggsave("Ecohydrological trade-offs following afforestation .png",
+       fig3,
+       width = 12,
+       height = 8,
+       dpi = 600)
+
+
+input_file <- "H:/My Drive/Afforestation_Analysis/Budyko_Basin_Data_Annual_FINAL.csv"
+
+df_basin <- fread(input_file)
+
+# Verify required columns
+required_cols <- c(
+  "HYBAS_ID", "year", "ET", "PET", "P_mm", "treated"
+)
+
+missing_cols <- setdiff(required_cols, names(df_basin))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing required columns: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+cat("Input rows:", nrow(df_basin), "\n")
+cat(
+  "Year range:",
+  min(df_basin$year, na.rm = TRUE), "-",
+  max(df_basin$year, na.rm = TRUE), "\n"
+)
+
+# ===============================
+# 1. CLEAN AND STANDARDIZE DATA
+# ===============================
+df_basin <- df_basin %>%
+  mutate(
+    year = as.integer(year),
+    HYBAS_ID = as.character(HYBAS_ID),
+    ET = as.numeric(ET),
+    PET = as.numeric(PET),
+    P_mm = as.numeric(P_mm),
+    treated = as.numeric(treated)
+  ) %>%
+  filter(
+    !is.na(HYBAS_ID),
+    !is.na(year),
+    year >= 2015,
+    year <= 2025
+  )
+
+print(
+  df_basin %>%
+    count(HYBAS_ID, year) %>%
+    count(n, name = "number_of_basin_years") %>%
+    arrange(n)
+)
+
+# ================================================================
+# 2. AGGREGATE TO ONE OBSERVATION PER BASIN-YEAR
+# ================================================================
+# This step accommodates repeated pixel-level or sub-basin records.
+# If the input already has one row per basin-year, values are
+# unchanged apart from removal of duplicate rows, if any.
+
+basin_annual_raw <- df_basin %>%
+  group_by(HYBAS_ID, year) %>%
+  summarise(
+    ET = if (all(is.na(ET))) NA_real_
+    else mean(ET, na.rm = TRUE),
+    
+    PET = if (all(is.na(PET))) NA_real_
+    else mean(PET, na.rm = TRUE),
+    
+    P_mm = if (all(is.na(P_mm))) NA_real_
+    else mean(P_mm, na.rm = TRUE),
+    
+    treated = if (all(is.na(treated))) NA_real_
+    else mean(treated, na.rm = TRUE),
+    
+    NDVI = if ("NDVI" %in% names(df_basin)) {
+      if (all(is.na(NDVI))) NA_real_
+      else mean(NDVI, na.rm = TRUE)
+    } else NA_real_,
+    
+    LST = if ("LST" %in% names(df_basin)) {
+      if (all(is.na(LST))) NA_real_
+      else mean(LST, na.rm = TRUE)
+    } else NA_real_,
+    
+    albedo = if ("albedo" %in% names(df_basin)) {
+      if (all(is.na(albedo))) NA_real_
+      else mean(albedo, na.rm = TRUE)
+    } else NA_real_,
+    
+    .groups = "drop"
+  )
+
+# Compute Budyko indices from the observed annual variables
+basin_annual <- basin_annual_raw %>%
+  mutate(
+    phi = PET / P_mm,
+    et_ratio = ET / P_mm,
+    period = if_else(year <= 2018, "Pre", "Post"),
+    period = factor(period, levels = c("Pre", "Post"))
+  )
+
+# ===============================
+# 3. STRICT QUALITY FILTER
+# ===============================
+# Exclude very low precipitation, invalid ratios, and extreme
+# aridity values to reduce unstable parameter estimation.
+#
+# These are analytical screening criteria, not universal
+# Budyko thresholds. Review sensitivity to the chosen limits.
+
+basin_annual <- basin_annual %>%
+  filter(
+    is.finite(phi),
+    is.finite(et_ratio),
+    is.finite(P_mm),
+    P_mm > 50,
+    ET >= 0,
+    PET >= 0,
+    et_ratio >= 0,
+    et_ratio <= 1.1,
+    phi > 0,
+    phi <= 5
+  )
+
+cat("\nValid basin-year observations:", nrow(basin_annual), "\n")
+cat("Pre observations:", sum(basin_annual$period == "Pre"), "\n")
+cat("Post observations:", sum(basin_annual$period == "Post"), "\n")
+
+# ===============================
+# 4. BASIN-LEVEL PRE/POST SUMMARY
+# ===============================
+basin_shift <- basin_annual %>%
+  group_by(HYBAS_ID, period) %>%
+  summarise(
+    phi = mean(phi, na.rm = TRUE),
+    et_ratio = mean(et_ratio, na.rm = TRUE),
+    n_years = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = period,
+    values_from = c(phi, et_ratio, n_years),
+    names_sep = "_"
+  ) %>%
+  filter(
+    is.finite(phi_Pre),
+    is.finite(phi_Post),
+    is.finite(et_ratio_Pre),
+    is.finite(et_ratio_Post)
+  )
+
+
+if (nrow(basin_shift) == 0) {
+  stop(
+    "No basins have valid observations in both periods. ",
+    "Check year coverage and filtering thresholds."
+  )
+}
+
+# ===============================
+# 5. RAW BUDYKO SPACE SHIFT
+# ===============================
+p_a <- ggplot(basin_shift) +
+  
+  geom_segment(
+    aes(
+      x = phi_Pre,
+      y = et_ratio_Pre,
+      xend = phi_Post,
+      yend = et_ratio_Post
+    ),
+    arrow = arrow(length = unit(0.15, "cm")),
+    color = "grey50",
+    alpha = 0.35,
+    linewidth = 0.35
+  ) +
+  
+  geom_point(
+    aes(phi_Pre, et_ratio_Pre),
+    color = "#2166AC",
+    alpha = 0.65,
+    size = 1.8
+  ) +
+  
+  geom_point(
+    aes(phi_Post, et_ratio_Post),
+    color = "#B2182B",
+    alpha = 0.65,
+    size = 1.8
+  ) +
+  
+  labs(
+    title = "(a) Budyko-space shifts",
+    x = "Aridity index (PET/P)",
+    y = "Evaporative index (ET/P)"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_a)
+
+# ===============================
+# 6. BUDYKO FUNCTIONS
+# ===============================
+
+# Fu equation
+fu_equation <- function(phi, w) {
+  1 + phi - (1 + phi^w)^(1 / w)
+}
+
+# Zhang equation
+zhang_fun <- function(phi, w) {
+  (1 + w * phi) /
+    (1 + w * phi + 1 / phi)
+}
+
+# Standard Budyko (1974) curve
+budyko_1974 <- function(phi) {
+  phi * tanh(1 / phi) *
+    (1 - exp(-phi))^0.5
+}
+
+# ===============================
+# 7. ESTIMATE BASIN-SPECIFIC OMEGA
+# ===============================
+estimate_w_fu <- function(phi, et) {
+  
+  if (
+    !is.finite(phi) ||
+    !is.finite(et) ||
+    phi <= 0 ||
+    et < 0 ||
+    et > 1 + 1e-8
+  ) {
+    return(NA_real_)
+  }
+  
+  objective <- function(w) {
+    fu_equation(phi, w) - et
+  }
+  
+  tryCatch({
+    
+    lo <- 0.1
+    hi <- 10
+    
+    if (objective(lo) * objective(hi) > 0) {
+      return(NA_real_)
+    }
+    
+    uniroot(
+      objective,
+      lower = lo,
+      upper = hi,
+      tol = 1e-7
+    )$root
+    
+  }, error = function(e) NA_real_)
+}
+
+
+estimate_w_zhang <- function(phi, et) {
+  
+  if (
+    !is.finite(phi) ||
+    !is.finite(et) ||
+    phi <= 0 ||
+    et < 0 ||
+    et > 1 + 1e-8
+  ) {
+    return(NA_real_)
+  }
+  
+  objective <- function(w) {
+    zhang_fun(phi, w) - et
+  }
+  
+  tryCatch({
+    
+    lo <- 0.1
+    hi <- 20
+    
+    if (objective(lo) * objective(hi) > 0) {
+      return(NA_real_)
+    }
+    
+    uniroot(
+      objective,
+      lower = lo,
+      upper = hi,
+      tol = 1e-7
+    )$root
+    
+  }, error = function(e) NA_real_)
+}
+
+# ===============================
+# 8. PRE/POST OMEGA ESTIMATION
+# ===============================
+omega_df <- basin_shift %>%
+  rowwise() %>%
+  mutate(
+    pre_w = estimate_w_fu(phi_Pre, et_ratio_Pre),
+    post_w = estimate_w_fu(phi_Post, et_ratio_Post),
+    delta_w = post_w - pre_w,
+    
+    pre_w_zhang = estimate_w_zhang(
+      phi_Pre, et_ratio_Pre
+    ),
+    
+    post_w_zhang = estimate_w_zhang(
+      phi_Post, et_ratio_Post
+    ),
+    
+    delta_w_zhang = post_w_zhang - pre_w_zhang
+  ) %>%
+  ungroup()
+
+cat("\nFu omega estimation:\n")
+cat("Valid pre estimates:", sum(is.finite(omega_df$pre_w)), "\n")
+cat("Valid post estimates:", sum(is.finite(omega_df$post_w)), "\n")
+
+cat("\nZhang omega estimation:\n")
+cat(
+  "Valid pre estimates:",
+  sum(is.finite(omega_df$pre_w_zhang)), "\n"
+)
+cat(
+  "Valid post estimates:",
+  sum(is.finite(omega_df$post_w_zhang)), "\n"
+)
+
+# Save basin-level estimates
+fwrite(
+  omega_df,
+  "H:/My Drive/Afforestation_Analysis/Budyko_Basin_Omega_PrePost.csv"
+)
+
+# ===============================
+# 9. FIT REFERENCE FU CURVE
+# ===============================
+valid_pre_w <- omega_df$pre_w[
+  is.finite(omega_df$pre_w)
+]
+
+if (length(valid_pre_w) == 0) {
+  stop("No valid pre-period Fu omega estimates.")
+}
+
+median_w <- median(valid_pre_w)
+
+w_q25 <- as.numeric(
+  quantile(valid_pre_w, 0.25, na.rm = TRUE)
+)
+
+w_q75 <- as.numeric(
+  quantile(valid_pre_w, 0.75, na.rm = TRUE)
+)
+
+phi_seq <- seq(0.2, 5, length.out = 400)
+
+budyko_curves <- data.frame(
+  phi = phi_seq,
+  
+  Fu_median = fu_equation(phi_seq, median_w),
+  
+  Fu_low = pmin(
+    fu_equation(phi_seq, w_q25),
+    fu_equation(phi_seq, w_q75)
+  ),
+  
+  Fu_high = pmax(
+    fu_equation(phi_seq, w_q25),
+    fu_equation(phi_seq, w_q75)
+  ),
+  
+  Budyko1974 = budyko_1974(phi_seq),
+  
+  Zhang_median = zhang_fun(phi_seq, median_w)
+)
+
+# ===============================
+# 10. CURVE LONG FORMAT
+# ===============================
+curves_long <- budyko_curves %>%
+  select(
+    phi,
+    Fu_median,
+    Budyko1974,
+    Zhang_median
+  ) %>%
+  pivot_longer(
+    cols = -phi,
+    names_to = "curve",
+    values_to = "value"
+  ) %>%
+  mutate(
+    curve = recode(
+      curve,
+      Fu_median = "Fu curve",
+      Budyko1974 = "Budyko (1974)",
+      Zhang_median = "Zhang curve"
+    )
+  )
+
+# ===============================
+# 11. REFERENCE-CURVE METRICS
+# ===============================
+# Evaluate the pre-period median Fu curve against pre-period
+# basin observations. This is a descriptive reference fit,
+# not an independent validation dataset.
+
+basin_shift <- basin_shift %>%
+  mutate(
+    et_pred_pre = fu_equation(phi_Pre, median_w)
+  )
+
+metric_data <- basin_shift %>%
+  filter(
+    is.finite(et_ratio_Pre),
+    is.finite(et_pred_pre)
+  )
+
+metrics <- metric_data %>%
+  summarise(
+    R = if (n() >= 2) {
+      cor(et_ratio_Pre, et_pred_pre)
+    } else {
+      NA_real_
+    },
+    
+    R2 = R^2,
+    
+    RMSE = sqrt(
+      mean((et_ratio_Pre - et_pred_pre)^2)
+    ),
+    
+    N = n()
+  )
+
+label_text <- paste0(
+  "Median pre-period ω = ", round(median_w, 2), "\n",
+  "N =196 "
+)
+
+# ===============================
+# 12. SELECT BASINS FOR PLOTTING
+# ===============================
+set.seed(42)
+
+basin_sample <- basin_shift %>%
+  slice_sample(
+    n = min(27, nrow(basin_shift))
+  )
+
+points_df <- bind_rows(
+  basin_sample %>%
+    transmute(
+      phi = phi_Pre,
+      et_ratio = et_ratio_Pre,
+      stage = "Pre"
+    ),
+  
+  basin_sample %>%
+    transmute(
+      phi = phi_Post,
+      et_ratio = et_ratio_Post,
+      stage = "Post"
+    )
+)
+
+# ===============================
+# 13. FINAL BUDYKO PLOT
+# ===============================
+p_budyko <- ggplot() +
+  
+  # Interquartile range of the Fu curves
+  geom_ribbon(
+    data = budyko_curves,
+    aes(
+      x = phi,
+      ymin = Fu_low,
+      ymax = Fu_high
+    ),
+    fill = "grey80",
+    alpha = 0.45
+  ) +
+  
+  # Reference curves
+  geom_line(
+    data = curves_long,
+    aes(
+      x = phi,
+      y = value,
+      linetype = curve
+    ),
+    linewidth = 0.9,
+    color = "black"
+  ) +
+  
+  # Basin-level pre/post transitions
+  geom_segment(
+    data = basin_sample,
+    aes(
+      x = phi_Pre,
+      y = et_ratio_Pre,
+      xend = phi_Post,
+      yend = et_ratio_Post
+    ),
+    arrow = arrow(length = unit(0.12, "cm")),
+    color = "grey45",
+    alpha = 0.55,
+    linewidth = 0.4
+  ) +
+  
+  # Observed basin-level indices
+  geom_point(
+    data = points_df,
+    aes(
+      x = phi,
+      y = et_ratio,
+      color = stage
+    ),
+    size = 1.8,
+    alpha = 0.9
+  ) +
+  
+  annotate(
+    "text",
+    x = 4.9,
+    y = 0.05,
+    label = label_text,
+    hjust = 1,
+    vjust = 0,
+    size = 3.5
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "Pre" = "#2166AC",
+      "Post" = "#B2182B"
+    )
+  ) +
+  
+  scale_linetype_manual(
+    values = c(
+      "Fu curve" = "solid",
+      "Budyko (1974)" = "dashed",
+      "Zhang curve" = "dotdash"
+    )
+  ) +
+  
+  coord_cartesian(
+    xlim = c(0.2, 5),
+    ylim = c(0, 1.1)
+  ) +
+  
+  labs(
+    x = "Aridity index (PET/P)",
+    y = "Evaporative index (ET/P)",
+    title = "(a)",
+    color = "Period",
+    linetype = "Reference curve"
+  ) +
+  
+  theme_pub +
+  
+  theme(
+    plot.title = element_text(
+      hjust = 0,
+      face = "bold",
+      size = 14
+    ),
+    
+    plot.title.position = "plot",
+    
+    legend.position = "top",
+    
+    panel.grid.minor = element_blank()
+  )+theme_pub
+
+print(p_budyko)
+
+
+# ------------------------------
+# 8. PANEL (b): Δomega distribution
+# ------------------------------
+
+set.seed(42)
+
+# Retain all basins with valid delta omega
+dw_data <- omega_df %>%
+  filter(is.finite(delta_w))
+
+N_dw <- nrow(dw_data)
+
+if (N_dw < 2) {
+  stop("Fewer than two basins have valid delta omega estimates.")
+}
+
+# Observed mean effect
+mean_dw <- mean(dw_data$delta_w)
+
+# Bootstrap confidence interval for the mean
+boot_mean_dw <- replicate(2000, {
+  sampled_dw <- sample(
+    dw_data$delta_w,
+    size = N_dw,
+    replace = TRUE
+  )
+  mean(sampled_dw)
+})
+
+ci_dw <- quantile(
+  boot_mean_dw,
+  probs = c(0.025, 0.975),
+  na.rm = TRUE
+)
+
+label_text <- paste0(
+  "Mean \u0394\u03c9 = ", round(mean_dw, 3), "\n",
+  "95% bootstrap CI = [",
+  round(ci_dw[1], 3), ", ", round(ci_dw[2], 3), "]\n"
+)
+
+p_b <- ggplot(dw_data, aes(x = delta_w)) +
+  geom_density(
+    fill = "#bdbdbd",
+    color = "#666666",
+    alpha = 0.7,
+    linewidth = 0.8
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "black",
+    linewidth = 0.9
+  ) +
+  geom_vline(
+    xintercept = mean_dw,
+    color = "#d95f0e",
+    linewidth = 1.1
+  ) +
+  geom_vline(
+    xintercept = ci_dw,
+    linetype = "dotted",
+    color = "#2c7fb8",
+    linewidth = 0.9
+  ) +
+  annotate(
+    "text",
+    x = -Inf,
+    y = Inf,
+    label = label_text,
+    hjust = -0.05,
+    vjust = 1.15,
+    size = 3.4
+  ) +
+  coord_cartesian(xlim = c(-0.5, 0.5)) +
+  labs(
+    title = "(b)",
+    x = expression(Delta * omega ~ "(post - pre)"),
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme_pub +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(
+      hjust = 0,
+      face = "bold",
+      size = 16
+    ),
+    plot.title.position = "plot"
+  )
+
+print(p_b)
+
+cat("Observed mean delta omega:", round(mean_dw, 4), "\n")
+cat("Bootstrap 95% CI:",
+    round(ci_dw[1], 4), "to", round(ci_dw[2], 4), "\n")
+
+# ------------------------------
+# 9. PANEL (c): Δomega vs exposure
+# ------------------------------
+
+# basin-level exposure fraction, bounded between 0 and 1.
+exposure_by_basin <- df_basin %>%
+  group_by(HYBAS_ID) %>%
+  summarise(
+    aff_intensity = mean(treated, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+basin_summary <- omega_df %>%
+  select(HYBAS_ID, delta_w) %>%
+  left_join(exposure_by_basin, by = "HYBAS_ID") %>%
+  filter(
+    is.finite(delta_w),
+    is.finite(aff_intensity)
+  )
+
+N_c <- nrow(basin_summary)
+
+if (N_c >= 3 && n_distinct(basin_summary$aff_intensity) >= 2) {
+  
+  model_c <- lm(delta_w ~ aff_intensity, data = basin_summary)
+  coefs <- summary(model_c)$coefficients
+  pval <- coefs["aff_intensity", "Pr(>|t|)"]
+  
+  
+  p_c <- ggplot(
+    basin_summary,
+    aes(x = aff_intensity, y = delta_w)
+  ) +
+    geom_point(
+      alpha = 0.7,
+      size = 2,
+      color = "#2c7fb8"
+    ) +
+    geom_smooth(
+      method = "lm",
+      se = TRUE,
+      color = "#d95f0e",
+      linewidth = 1.1
+    ) +
+    geom_hline(
+      yintercept = 0,
+      linetype = "dashed",
+      color = "gray40"
+    )  +
+    labs(
+      title = "(c)",
+      x = "Afforestation exposure",
+      y = expression(Delta * omega)
+    ) +
+    theme_minimal(base_size = 12) +
+    theme_pub +
+    theme(
+      plot.title = element_text(
+        hjust = 0,
+        face = "bold",
+        size = 16
+      ),
+      plot.title.position = "plot"
+    )
+  
+} else {
+  warning(
+    "Panel (c) regression skipped: insufficient basins ",
+    "or no variation in afforestation exposure."
+  )
+}
+
+if (exists("p_c")) print(p_c)
+
+
+
+
+# ------------------------------
+# 10. PANEL (d): ET/P change
+# ------------------------------
+
+et_compare <- basin_shift %>%
+  filter(
+    is.finite(et_ratio_Pre),
+    is.finite(et_ratio_Post)
+  )
+
+p_d <- ggplot(
+  et_compare,
+  aes(x = et_ratio_Pre, y = et_ratio_Post)
+) +
+  geom_hex(bins = 25, alpha = 0.85) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "#2c7fb8",
+    linewidth = 1
+  ) +
+  scale_fill_gradient(
+    low = "grey50",
+    high = "black",
+    name = "Basin density"
+  ) +
+  labs(
+    title = "(d)",
+    x = "ET/P (2015–2018)",
+    y = "ET/P (2019–2025)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme_pub +
+  theme(
+    plot.title = element_text(
+      hjust = 0,
+      face = "bold",
+      size = 16
+    ),
+    plot.title.position = "plot"
+  )
+
+print(p_d)
+
+cat("Panel (d) paired basin N:", nrow(et_compare), "\n")
+
+# ------------------------------
+# 11. FINAL FIGURE
+# ------------------------------
+
+fig4 <- (p_budyko | p_b) / (p_c | p_d)
+
+print(fig4)
+
+ggsave(
+  filename = "Budyko_FINAL.png",
+  plot = fig4,
+  width = 14,
+  height = 10,
+  dpi = 600,
+  bg = "white"
+)
+
+ggsave(
+  filename = "Budyko_FINAL.tif",
+  plot = fig4,
+  width = 14,
+  height = 10,
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+cat("\n============================================\n")
+cat("BUDYKO ANALYSIS COMPLETED\n")
+cat("============================================\n")
+cat("Matched basins:", nrow(basin_shift), "\n")
+cat("Median pre-period Fu omega:", round(median_w, 3), "\n")
+cat("Reference curve R-squared:", round(metrics$R2, 3), "\n")
+cat("Reference curve RMSE:", round(metrics$RMSE, 3), "\n")
+cat("Outputs saved to:", output_dir, "\n")
