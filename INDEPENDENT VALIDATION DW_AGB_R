@@ -1,0 +1,995 @@
+
+# ============================================================
+# DYNAMIC WORLD–GLI AFFORESTATION VALIDATION
+# 2019–2025
+# ============================================================
+
+
+# ============================================================
+# 1. PACKAGES
+# ============================================================
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(irr)
+library(patchwork)
+library(patchwork)
+
+# ============================================================
+# 2. WORKING DIRECTORY
+# ============================================================
+
+setwd("G:/My Drive/R_Results")
+
+
+# ============================================================
+# 3. PUBLICATION THEME
+# ============================================================
+
+theme_pub <- theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5,
+      size = 16
+    ),
+    
+    axis.title = element_text(
+      face = "bold",
+      size = 14
+    ),
+    
+    axis.text = element_text(
+      color = "black",
+      size = 12,
+      face = "bold"
+    ),
+    
+    axis.text.x = element_text(
+      angle = 45,
+      vjust = 0.6,
+      hjust = 0.8
+    ),
+    
+    axis.line = element_line(
+      color = "black",
+      linewidth = 1
+    ),
+    
+    panel.grid.minor = element_blank(),
+    
+    plot.margin = margin(
+      15, 20, 15, 20
+    ),
+    
+    legend.title = element_text(
+      face = "bold",
+      size = 12
+    ),
+    
+    legend.text = element_text(
+      size = 12
+    )
+  )
+
+
+# ============================================================
+# 4. GLI REPORTED AFFORESTATION AREA
+# ============================================================
+
+gli <- data.frame(
+  year = 2019:2025,
+  
+  area_ha = c(
+    1349.09,
+    9738.358,
+    48285.23,
+    44701.01,
+    48190.46,
+    55535.4,
+    68885.6
+  )
+)
+
+
+# ============================================================
+# 5. DYNAMIC WORLD AFFORESTATION AREA
+# ============================================================
+
+dw <- read.csv(
+  "I:/DW_Forest_Gain_2019_2025.csv"
+) %>%
+  mutate(
+    dw_area_ha = gain_m2 / 10000
+  )
+
+
+# ============================================================
+# 6. FINAL SEVEN-YEAR VALIDATION TABLE
+# ============================================================
+
+validation <- dw %>%
+  select(year, dw_area_ha) %>%
+  left_join(
+    gli,
+    by = "year"
+  ) %>%
+  arrange(year)
+
+
+# Display validation table
+print(validation)
+
+
+# Confirm number of annual observations
+cat(
+  "Number of annual observations:",
+  nrow(validation),
+  "\n"
+)
+
+
+# ============================================================
+# 7. FIGURE 2A — TEMPORAL COMPARISON
+# ============================================================
+
+p1 <- ggplot(
+  validation,
+  aes(x = year)
+) +
+  
+  # Dynamic World
+  geom_line(
+    aes(
+      y = dw_area_ha,
+      color = "Dynamic World"
+    ),
+    linewidth = 1.2
+  ) +
+  
+  geom_point(
+    aes(
+      y = dw_area_ha,
+      color = "Dynamic World"
+    ),
+    size = 2.5
+  ) +
+  
+  # GLI
+  geom_line(
+    aes(
+      y = area_ha,
+      color = "GLI Reports"
+    ),
+    linewidth = 1.2,
+    linetype = "dashed"
+  ) +
+  
+  geom_point(
+    aes(
+      y = area_ha,
+      color = "GLI Reports"
+    ),
+    size = 2.5
+  ) +
+  
+  # Dynamic World labels
+  geom_text(
+    aes(
+      y = dw_area_ha,
+      label = round(dw_area_ha, 0),
+      color = "Dynamic World"
+    ),
+    vjust = -0.8,
+    size = 3,
+    show.legend = FALSE
+  ) +
+  
+  # GLI labels
+  geom_text(
+    aes(
+      y = area_ha,
+      label = round(area_ha, 0),
+      color = "GLI Reports"
+    ),
+    vjust = 1.2,
+    size = 3,
+    show.legend = FALSE
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "Dynamic World" = "#1b9e77",
+      "GLI Reports" = "#d95f02"
+    )
+  ) +
+  
+  scale_y_continuous(
+    labels = comma
+  ) +
+  
+  labs(
+    x = "Year",
+    y = "Afforestation Area (ha)",
+    color = NULL,
+    title = "(a)"
+  ) +
+  
+  theme_pub +
+  
+  # Legend will be collected below the combined figure
+  theme(
+    legend.position = "none"
+  )
+
+
+# ============================================================
+# 8. FIGURE 2B — 1:1 COMPARISON
+# ============================================================
+
+min_val <- min(
+  c(
+    validation$area_ha,
+    validation$dw_area_ha
+  ),
+  na.rm = TRUE
+)
+
+max_val <- max(
+  c(
+    validation$area_ha,
+    validation$dw_area_ha
+  ),
+  na.rm = TRUE
+)
+
+
+p2 <- ggplot(
+  validation,
+  aes(
+    x = area_ha,
+    y = dw_area_ha
+  )
+) +
+  
+  # Observed annual values
+  geom_point(
+    size = 3,
+    alpha = 0.8,
+    color = "#2c7fb8"
+  ) +
+  
+  # Perfect agreement line
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linewidth = 1,
+    color = "black"
+  ) +
+  
+  # Regression line for visual comparison only
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    linetype = "dashed",
+    color = "red"
+  ) +
+  
+  coord_equal(
+    xlim = c(min_val, max_val),
+    ylim = c(min_val, max_val)
+  ) +
+  
+  scale_x_continuous(
+    labels = comma
+  ) +
+  
+  scale_y_continuous(
+    labels = comma
+  ) +
+  
+  labs(
+    x = "GLI Reported Afforestation Area (ha)",
+    y = "DW Estimated Area (ha)",
+    title = "(b)"
+  ) +
+  
+  theme_pub
+
+
+# ============================================================
+# 9. BLAND–ALTMAN AGREEMENT ANALYSIS
+# ============================================================
+
+validation <- validation %>%
+  mutate(
+    mean_val =
+      (dw_area_ha + area_ha) / 2,
+    
+    diff_val =
+      dw_area_ha - area_ha
+  )
+
+
+# Mean bias
+bias <- mean(
+  validation$diff_val,
+  na.rm = TRUE
+)
+
+
+# Standard deviation of differences
+sd_diff <- sd(
+  validation$diff_val,
+  na.rm = TRUE
+)
+
+
+# 95% limits of agreement
+loa_upper <-
+  bias + 1.96 * sd_diff
+
+loa_lower <-
+  bias - 1.96 * sd_diff
+
+
+# Number of observations
+n <- nrow(validation)
+
+
+# ============================================================
+# 10. FIGURE 2C — BLAND–ALTMAN PLOT
+# ============================================================
+
+p3 <- ggplot(
+  validation,
+  aes(
+    x = mean_val,
+    y = diff_val
+  )
+) +
+  
+  geom_point(
+    size = 3,
+    color = "#2c7fb8"
+  ) +
+  
+  # Mean bias
+  geom_hline(
+    aes(
+      yintercept = bias,
+      color = "Mean bias",
+      linetype = "Mean bias"
+    ),
+    linewidth = 1
+  ) +
+  
+  # Upper limit of agreement
+  geom_hline(
+    aes(
+      yintercept = loa_upper,
+      color = "Upper LoA",
+      linetype = "Upper LoA"
+    )
+  ) +
+  
+  # Lower limit of agreement
+  geom_hline(
+    aes(
+      yintercept = loa_lower,
+      color = "Lower LoA",
+      linetype = "Lower LoA"
+    )
+  ) +
+  
+  labs(
+    x = "Mean of DW and GLI (ha)",
+    y = "Difference (DW − GLI) (ha)",
+    title = "(c)",
+    color = NULL,
+    linetype = NULL
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "Mean bias" = "red",
+      "Upper LoA" = "black",
+      "Lower LoA" = "black"
+    )
+  ) +
+  
+  scale_linetype_manual(
+    values = c(
+      "Mean bias" = "solid",
+      "Upper LoA" = "dashed",
+      "Lower LoA" = "dashed"
+    ),
+    guide = guide_legend(position = "bottom")
+  ) +
+  
+  annotate(
+    "text",
+    x = min(validation$mean_val, na.rm = TRUE),
+    y = max(validation$diff_val, na.rm = TRUE),
+    hjust = 0,
+    vjust = 1,
+    label = paste0(
+      "Bias = ", round(bias, 0),
+      "\nUpper LoA = ", round(loa_upper, 0),
+      "\nLower LoA = ", round(loa_lower, 0),
+      "\nn = ", n
+    ),
+    size = 3.0
+  ) +
+  
+  theme_pub 
+  
+# ============================================================
+# 11. COMBINE FIGURE 2
+# ============================================================
+
+# ============================================================
+# 11. COMBINE FIGURE 2 — SHARED LEGEND AT BOTTOM
+# ============================================================
+
+fig_validation <-
+  (p1 | p2 | p3) +
+  plot_layout(
+    guides = "collect",
+    axes = "keep"
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.justification = "center",
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.background = element_blank(),
+    legend.key = element_blank(),
+    legend.text = element_text(size = 9)
+  )
+
+print(fig_validation)
+
+# ============================================================
+# 12. EXPORT FIGURE 2
+# ============================================================
+
+ggsave(
+  "Validation_of_afforestation.png",
+  fig_validation,
+  width = 14,
+  height = 6.5,
+  dpi = 600
+)
+
+
+# ============================================================
+# 13. SAVE FINAL VALIDATION TABLE
+# ============================================================
+
+write.csv(
+  validation,
+  "Final_DW_GLI_validation_table.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 14. LULC VALIDATION DATA
+# ============================================================
+
+data <- read.csv(
+  "G:/My Drive/Stratified_Validation_DW_2019_2025.csv"
+) %>%
+  select(
+    LULC,
+    ref
+  )
+
+
+data$LULC <- as.factor(data$LULC)
+data$ref  <- as.factor(data$ref)
+
+
+# ============================================================
+# 15. CONFUSION MATRIX
+# ============================================================
+
+cm <- table(
+  data$ref,
+  data$LULC
+)
+
+print(cm)
+
+
+# ============================================================
+# 16. OVERALL ACCURACY
+# ============================================================
+
+oa <- sum(
+  diag(cm)
+) / sum(cm)
+
+print(oa)
+
+
+# ============================================================
+# 17. PRODUCER'S AND USER'S ACCURACY
+# ============================================================
+
+pa <- diag(cm) /
+  rowSums(cm)
+
+ua <- diag(cm) /
+  colSums(cm)
+
+
+accuracy_table <- data.frame(
+  Class = rownames(cm),
+  
+  Producer_Accuracy =
+    round(pa, 3),
+  
+  User_Accuracy =
+    round(ua, 3)
+)
+
+print(accuracy_table)
+
+
+# ============================================================
+# 18. COHEN'S KAPPA
+# ============================================================
+
+kappa_result <- kappa2(
+  data[, c("ref", "LULC")]
+)
+
+print(kappa_result)
+
+
+# ============================================================
+# 19. CLASS-WISE VALIDATION ACCURACY
+# ============================================================
+
+data$correct <-
+  ifelse(
+    data$ref == data$LULC,
+    "Correct",
+    "Incorrect"
+  )
+
+
+p_accuracy <- ggplot(
+  data,
+  aes(
+    x = ref,
+    fill = correct
+  )
+) +
+  
+  geom_bar(
+    position = "fill"
+  ) +
+  
+  scale_y_continuous(
+    labels = percent
+  ) +
+  
+  labs(
+    x = "Reference Class",
+    y = "Proportion",
+    fill = "Classification"
+  ) +
+  
+  theme_pub
+
+
+print(p_accuracy)
+
+
+# ============================================================
+# 20. EXPORT LULC ACCURACY FIGURE
+# ============================================================
+
+ggsave(
+  "LULC_validation_accuracy.png",
+  p_accuracy,
+  width = 8,
+  height = 6,
+  dpi = 600
+)
+
+
+# ============================================================
+# END
+# ============================================================
+
+# ============================================================
+# INDEPENDENT VALIDATION: FIELD-PLOT AGB vs RF-PREDICTED AGB
+# Study: Bale Mountains Eco-Region (BMER)
+# Inputs:
+#   1. Field_Plot_AGB.csv
+#   2. Final_2025_FieldPlot_S1_S2_GEDI_RF_AGB.csv
+#
+# - Matches by plot ID (not row order)
+# - Windows-safe column-name normalization
+# - Validates independent field AGB against RF predictions
+# ============================================================
+
+# -----------------------------
+# 0. Packages
+# -----------------------------
+required_packages <- c("readr", "dplyr", "ggplot2", "tibble")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+# -----------------------------
+# 1. File paths
+# -----------------------------
+data_dir <- "G:/My Drive/GEE_Field_Validation"
+field_file <- file.path(data_dir, "Field_Plot_AGB (2).csv")
+rf_file    <- file.path(data_dir, "Final_2025_FieldPlot_S1_S2_GEDI_RF_AGB (1).csv")
+output_dir <- file.path(data_dir, "Independent_AGB_Validation_Results")
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+if (!file.exists(field_file)) {
+  stop("Field AGB file not found: ", field_file,
+       "\nCheck the folder path and exact filename.")
+}
+if (!file.exists(rf_file)) {
+  stop("RF prediction file not found: ", rf_file,
+       "\nCheck the folder path and exact filename.")
+}
+
+# -----------------------------
+# 2. Read files
+# -----------------------------
+field_raw <- readr::read_csv(
+  field_file,
+  show_col_types = FALSE,
+  locale = readr::locale(encoding = "UTF-8"),
+  name_repair = "unique"
+)
+rf_raw <- readr::read_csv(
+  rf_file,
+  show_col_types = FALSE,
+  locale = readr::locale(encoding = "UTF-8"),
+  name_repair = "unique"
+)
+
+cat("\nFIELD FILE COLUMNS:\n")
+print(names(field_raw))
+cat("\nRF FILE COLUMNS:\n")
+print(names(rf_raw))
+cat("\nField rows:", nrow(field_raw), "\n")
+cat("RF rows:", nrow(rf_raw), "\n")
+
+# -----------------------------
+# 3. Column-name helpers (Windows-safe)
+# -----------------------------
+normalize_name <- function(x) {
+  x <- as.character(x)
+  x <- iconv(x, from = "", to = "UTF-8", sub = "")
+  x[is.na(x)] <- ""
+  x <- iconv(x, from = "UTF-8", to = "ASCII//TRANSLIT", sub = "")
+  x[is.na(x)] <- ""
+  x <- tolower(x)
+  gsub("[^[:alnum:]]", "", x, perl = FALSE)
+}
+
+find_column <- function(data, candidates, description) {
+  nm <- names(data)
+  nm_norm <- normalize_name(nm)
+  cand_norm <- normalize_name(candidates)
+  
+  idx <- match(cand_norm, nm_norm, nomatch = 0L)
+  idx <- idx[idx > 0L]
+  if (length(idx) > 0L) return(nm[idx[1]])
+  
+  for (candidate in cand_norm) {
+    if (!nzchar(candidate)) next
+    hits <- which(grepl(candidate, nm_norm, fixed = TRUE))
+    if (length(hits) == 1L) return(nm[hits])
+  }
+  
+  stop(
+    "Could not automatically identify the ", description, " column.\n",
+    "Available columns: ", paste(nm, collapse = ", "), "\n",
+    "Set field_id_col / rf_id_col / field_agb_col / rf_agb_col manually below."
+  )
+}
+
+# Automatic detection
+field_id_col <- find_column(
+  field_raw,
+  c("plot_id", "plotid", "plot", "plot_code", "plotcode",
+    "sample_id", "sampleid", "id"),
+  "FIELD plot-ID"
+)
+
+rf_id_col <- find_column(
+  rf_raw,
+  c("plot_id", "plotid", "plot", "plot_code", "plotcode",
+    "sample_id", "sampleid", "id", "system:index"),
+  "RF plot-ID"
+)
+
+field_agb_col <- find_column(
+  field_raw,
+  c("field_agb_mg_ha", "field_agb", "agb_field", "agb_mg_ha",
+    "agb_mgha", "agb", "aboveground_biomass", "abovegroundbiomass",
+    "observed_agb", "measured_agb", "AGB_Mg_ha"),
+  "FIELD measured AGB"
+)
+
+rf_agb_col <- find_column(
+  rf_raw,
+  c("AGB_Mg_ha", "RF_AGB_Mg_ha", "RF_AGB", "rf_agb_pred", "predicted_agb",
+    "agb_pred", "agb_prediction", "predicted_agb_mg_ha",
+    "rf_prediction", "classification", "agbd"),
+  "RF-predicted AGB"
+)
+
+# ---- MANUAL OVERRIDE (uncomment if auto-detect is wrong) ----
+# field_id_col  <- "plot_id"
+# rf_id_col     <- "plot_id"
+# field_agb_col <- "AGB_Mg_ha"
+# rf_agb_col    <- "rf_agb_pred"
+
+cat("\nCOLUMN MAPPING USED:\n")
+cat("Field plot ID:", field_id_col, "\n")
+cat("RF plot ID:", rf_id_col, "\n")
+cat("Observed field AGB:", field_agb_col, "\n")
+cat("RF predicted AGB:", rf_agb_col, "\n")
+
+# -----------------------------
+# 4. Prepare and validate fields
+# -----------------------------
+to_numeric_safe <- function(x) {
+  if (is.numeric(x)) return(as.numeric(x))
+  suppressWarnings(as.numeric(gsub(",", "", trimws(as.character(x)))))
+}
+
+field <- field_raw %>%
+  transmute(
+    plot_id   = trimws(as.character(.data[[field_id_col]])),
+    field_agb = to_numeric_safe(.data[[field_agb_col]])
+  ) %>%
+  filter(!is.na(plot_id), plot_id != "")
+
+rf <- rf_raw %>%
+  transmute(
+    plot_id = trimws(as.character(.data[[rf_id_col]])),
+    rf_agb  = to_numeric_safe(.data[[rf_agb_col]])
+  ) %>%
+  filter(!is.na(plot_id), plot_id != "")
+
+field_duplicates <- field %>% count(plot_id) %>% filter(n > 1)
+rf_duplicates    <- rf %>% count(plot_id) %>% filter(n > 1)
+
+if (nrow(field_duplicates) > 0) {
+  readr::write_csv(field_duplicates,
+                   file.path(output_dir, "Duplicate_Field_Plot_IDs.csv"))
+  stop(
+    "Field file contains duplicated plot IDs. See Duplicate_Field_Plot_IDs.csv. ",
+    "Resolve duplicates before validation."
+  )
+}
+if (nrow(rf_duplicates) > 0) {
+  readr::write_csv(rf_duplicates,
+                   file.path(output_dir, "Duplicate_RF_Plot_IDs.csv"))
+  stop(
+    "RF file contains duplicated plot IDs. See Duplicate_RF_Plot_IDs.csv. ",
+    "Resolve duplicates before validation."
+  )
+}
+
+# -----------------------------
+# 5. Match by plot ID
+# -----------------------------
+matched_all <- dplyr::inner_join(field, rf, by = "plot_id") %>%
+  mutate(
+    field_agb = as.numeric(field_agb),
+    rf_agb    = as.numeric(rf_agb)
+  )
+
+unmatched_field <- dplyr::anti_join(field, rf, by = "plot_id")
+unmatched_rf    <- dplyr::anti_join(rf, field, by = "plot_id")
+
+readr::write_csv(matched_all,
+                 file.path(output_dir, "Matched_Field_RF_AGB_All.csv"))
+readr::write_csv(unmatched_field,
+                 file.path(output_dir, "Field_Plots_Without_RF_Prediction.csv"))
+readr::write_csv(unmatched_rf,
+                 file.path(output_dir, "RF_Predictions_Without_Field_Plot.csv"))
+
+validation <- matched_all %>%
+  filter(is.finite(field_agb), is.finite(rf_agb))
+
+cat("\nMATCH SUMMARY\n")
+cat("Field records with plot IDs:", nrow(field), "\n")
+cat("RF records with plot IDs:", nrow(rf), "\n")
+cat("Matched plot IDs:", nrow(matched_all), "\n")
+cat("Matched pairs with valid numeric AGB:", nrow(validation), "\n")
+cat("Field IDs without RF predictions:", nrow(unmatched_field), "\n")
+cat("RF IDs without field observations:", nrow(unmatched_rf), "\n")
+
+if (nrow(validation) < 3) {
+  stop(
+    "Fewer than 3 valid matched field–RF pairs. Check plot IDs, AGB columns, ",
+    "and the input files."
+  )
+}
+
+if (any(validation$field_agb < 0, na.rm = TRUE) ||
+    any(validation$rf_agb < 0, na.rm = TRUE)) {
+  warning("Negative AGB values were found. Check units and data quality.")
+}
+
+# -----------------------------
+# 6. Independent validation metrics
+# -----------------------------
+obs  <- validation$field_agb
+pred <- validation$rf_agb
+resid <- pred - obs
+n <- length(obs)
+
+rmse <- sqrt(mean(resid^2))
+mae  <- mean(abs(resid))
+bias <- mean(resid)   # RF − field
+mean_obs  <- mean(obs)
+mean_pred <- mean(pred)
+
+pearson_r <- if (sd(obs) > 0 && sd(pred) > 0) cor(obs, pred) else NA_real_
+r_squared_correlation <- pearson_r^2
+
+r2_predictive <- if (sum((obs - mean(obs))^2) > 0) {
+  1 - sum((pred - obs)^2) / sum((obs - mean(obs))^2)
+} else {
+  NA_real_
+}
+
+calibration_model <- lm(obs ~ pred)
+intercept <- unname(coef(calibration_model)[1])
+slope     <- unname(coef(calibration_model)[2])
+slope_ci  <- tryCatch(
+  unname(confint(calibration_model, "pred", level = 0.95)),
+  error = function(e) c(NA_real_, NA_real_)
+)
+
+mape <- if (all(obs != 0)) mean(abs((pred - obs) / obs)) * 100 else NA_real_
+
+metrics <- tibble::tibble(
+  metric = c(
+    "Number of matched validation plots",
+    "Mean observed field AGB (Mg ha-1)",
+    "Mean RF-predicted AGB (Mg ha-1)",
+    "RMSE (Mg ha-1)",
+    "MAE (Mg ha-1)",
+    "Bias: RF prediction minus field observation (Mg ha-1)",
+    "Pearson correlation (r)",
+    "Squared Pearson correlation (r2)",
+    "Predictive R-squared (1 - SSE/SST)",
+    "Calibration intercept: observed ~ predicted",
+    "Calibration slope: observed ~ predicted",
+    "Calibration slope 95% CI lower",
+    "Calibration slope 95% CI upper",
+    "MAPE (%)"
+  ),
+  value = c(
+    n, mean_obs, mean_pred, rmse, mae, bias, pearson_r,
+    r_squared_correlation, r2_predictive, intercept, slope,
+    slope_ci[1], slope_ci[2], mape
+  )
+)
+
+readr::write_csv(metrics, file.path(output_dir, "AGB_Validation_Metrics.csv"))
+readr::write_csv(validation, file.path(output_dir, "Matched_Field_RF_AGB_Validation.csv"))
+
+cat("\nINDEPENDENT FIELD vs RF VALIDATION METRICS\n")
+print(metrics, n = Inf)
+
+# -----------------------------
+# 7. Scatterplot with 1:1 line
+# -----------------------------
+plot_range <- range(c(obs, pred), finite = TRUE)
+plot_pad <- diff(plot_range) * 0.05
+if (!is.finite(plot_pad) || plot_pad == 0) plot_pad <- 1
+axis_limits <- c(plot_range[1] - plot_pad, plot_range[2] + plot_pad)
+
+subtitle_text <- sprintf(
+  "n = %d | RMSE = %.2f | MAE = %.2f | Bias = %.2f | r = %.3f",
+  n, rmse, mae, bias, pearson_r
+)
+
+p_scatter <- ggplot(validation, aes(x = field_agb, y = rf_agb)) +
+  geom_point(size = 2.6, alpha = 0.8) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", linewidth = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+  coord_equal(xlim = axis_limits, ylim = axis_limits) +
+  labs(
+    title = "Independent validation of RF-predicted aboveground biomass",
+    subtitle = subtitle_text,
+    x = expression("Field-measured AGB (Mg ha"^{-1}*")"),
+    y = expression("RF-predicted AGB (Mg ha"^{-1}*")"),
+    caption = "Dashed line: 1:1 agreement. Solid line: fitted linear relationship."
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+print(p_scatter)
+ggsave(
+  filename = file.path(output_dir, "Field_vs_RF_AGB_Scatterplot.png"),
+  plot = p_scatter, width = 7.2, height = 6.2, dpi = 600
+)
+ggsave(
+  filename = file.path(output_dir, "Field_vs_RF_AGB_Scatterplot.pdf"),
+  plot = p_scatter, width = 7.2, height = 6.2
+)
+
+# -----------------------------
+# 8. Residual diagnostics
+# -----------------------------
+validation_diagnostics <- validation %>%
+  mutate(
+    residual_prediction_minus_field = rf_agb - field_agb,
+    absolute_error = abs(rf_agb - field_agb),
+    squared_error  = (rf_agb - field_agb)^2
+  )
+
+readr::write_csv(
+  validation_diagnostics,
+  file.path(output_dir, "AGB_Validation_Residuals.csv")
+)
+
+p_residual <- ggplot(
+  validation_diagnostics,
+  aes(x = rf_agb, y = residual_prediction_minus_field)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_point(size = 2.5, alpha = 0.8) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 0.8) +
+  labs(
+    title = "RF AGB validation residuals",
+    x = expression("RF-predicted AGB (Mg ha"^{-1}*")"),
+    y = expression("Prediction error: RF - field (Mg ha"^{-1}*")")
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave(
+  file.path(output_dir, "AGB_Validation_Residual_Plot.png"),
+  p_residual, width = 7.2, height = 5.5, dpi = 600
+)
+
+# -----------------------------
+# 9. Completion message
+# -----------------------------
+cat("\n============================================================\n")
+cat("VALIDATION FINISHED\n")
+cat("Results folder:\n",
+    normalizePath(output_dir, winslash = "/", mustWork = FALSE), "\n")
+cat("Valid matched plots:", nrow(validation), "\n")
+cat("RMSE:", round(rmse, 3), "Mg ha-1\n")
+cat("MAE:", round(mae, 3), "Mg ha-1\n")
+cat("Bias (RF - field):", round(bias, 3), "Mg ha-1\n")
+cat("Pearson r:", round(pearson_r, 4), "\n")
+cat("Predictive R-squared:", round(r2_predictive, 4), "\n")
+cat("============================================================\n")
+
+# Notes for reporting:
+# - RMSE, MAE, and bias use independent matched plots only.
+# - Predictive R-squared = 1 - SSE/SST and can be negative.
+# - Squared Pearson r is not the same as predictive R-squared.
+# - Resolve duplicate plot IDs or multi-date RF rows before validation.
